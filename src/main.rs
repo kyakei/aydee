@@ -469,8 +469,18 @@ fn setup_run_output_dir(target: &str) {
 }
 
 fn add_domain_candidate(current: &mut Option<String>, candidate: String) {
-    if current.is_none() {
-        *current = Some(candidate.trim().to_ascii_lowercase());
+    let Some(candidate_norm) = dns::normalize_domain_name(&candidate) else {
+        return;
+    };
+    match current {
+        None => {
+            *current = Some(candidate_norm);
+        }
+        Some(cur) => {
+            if dns::should_replace_domain(cur, &candidate_norm) {
+                *current = Some(candidate_norm);
+            }
+        }
     }
 }
 

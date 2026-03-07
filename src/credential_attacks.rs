@@ -34,7 +34,9 @@ pub async fn run(
         }
     }
 
-    // AS-REP roasting against discovered users (no password required)
+    // AS-REP roasting:
+    // 1) authenticated broad discovery if creds are available
+    // 2) discovered-user no-auth spray as an additional path
     if let (Some(user), Some(pass)) = (username, password) {
         attempt_getnpusers_authenticated(target, domain, user, pass, &mut findings).await;
     } else if let (Some(user), Some(hash)) = (username, ntlm) {
@@ -42,12 +44,10 @@ pub async fn run(
     } else if let Some(user) = username {
         if kerberos {
             attempt_getnpusers_authenticated_kerberos(target, domain, user, &mut findings).await;
-        } else if !discovered_users.is_empty() {
-            attempt_getnpusers_noauth(target, domain, discovered_users, &mut findings).await;
-        } else {
-            output::warning("No discovered users available for AS-REP no-auth attempt");
         }
-    } else if !discovered_users.is_empty() {
+    }
+
+    if !discovered_users.is_empty() {
         attempt_getnpusers_noauth(target, domain, discovered_users, &mut findings).await;
     } else {
         output::warning("No discovered users available for AS-REP attempt");

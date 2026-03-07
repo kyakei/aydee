@@ -99,6 +99,8 @@ Artifacts (reports, hashes, tickets, tool outputs) are written under that run di
 - If Kerberos-related actions are in scope, aydee attempts startup clock sync unless disabled.
 - Kerberos auth paths are only used when `-k/--kerberos` is explicitly provided. A ccache alone will not auto-enable Kerberos mode.
 - When authenticated abuse indicators are detected, aydee can prompt (default `N`) to attempt a temporary fake-SPN write + roast + cleanup flow.
+- BloodHound collection now retries with `--dns-tcp` when DNS resolution via UDP fails/timeouts.
+- External credential attack helper commands are bounded by internal timeouts to avoid indefinite hangs.
 - External tooling availability (e.g., impacket/bloodhound-python/certipy/nxc) affects which sub-steps can execute.
 
 ## Legal

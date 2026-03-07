@@ -87,20 +87,39 @@ pub async fn run(
         }
     });
 
-    let bind_principal = if username.contains('@') || username.contains('\\') {
-        username.to_string()
+    let mut bind_candidates = Vec::new();
+    if username.contains('@') || username.contains('\\') {
+        bind_candidates.push(username.to_string());
     } else {
-        format!("{}@{}", username, domain)
-    };
+        bind_candidates.push(format!("{}@{}", username, domain));
+        let short = domain.split('.').next().unwrap_or(domain);
+        bind_candidates.push(format!("{}\\{}", short, username));
+        bind_candidates.push(username.to_string());
+    }
+    let mut seen = HashSet::new();
+    bind_candidates.retain(|p| seen.insert(p.to_ascii_lowercase()));
 
-    let bind = ldap.simple_bind(&bind_principal, password).await?;
-    if bind.rc != 0 {
-        output::fail(&format!("Authenticated LDAP bind rejected (rc: {})", bind.rc));
+    let mut bind_principal = String::new();
+    let mut last_rc: Option<u32> = None;
+    for principal in bind_candidates {
+        let bind = ldap.simple_bind(&principal, password).await?;
+        if bind.rc == 0 {
+            bind_principal = principal;
+            break;
+        }
+        last_rc = Some(bind.rc);
+    }
+    if bind_principal.is_empty() {
+        let rc = last_rc
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        output::fail(&format!("Authenticated LDAP bind rejected (rc: {})", rc));
         let _ = ldap.unbind().await;
         return Ok(result);
     }
     result.ldap_bind_ok = true;
     output::success("Authenticated LDAP bind successful");
+    output::kv("LDAP Bind Principal", &bind_principal);
 
     result.usernames = collect_usernames(&mut ldap, &base_dn).await?;
     output::success(&format!(
@@ -818,8 +837,10 @@ async fn attempt_impacket_kerberoast(
             .arg(output_file)
             .arg(format!("{}/{}:{}", domain, username, password));
 
-        match cmd.output().await {
-            Ok(out) if out.status.success() => {
+        match timeout(Duration::from_secs(60), cmd.output()).await {
+            Err(_) => continue,
+            Ok(Err(_)) => continue,
+            Ok(Ok(out)) if out.status.success() => {
                 findings.push(AuthFinding {
                     id: "AUTH-KERBEROAST-HASHES".to_string(),
                     severity: "high".to_string(),
@@ -831,7 +852,6 @@ async fn attempt_impacket_kerberoast(
                 return;
             }
             Ok(_) => continue,
-            Err(_) => continue,
         }
     }
 }
@@ -867,8 +887,10 @@ async fn attempt_impacket_asrep(
             .arg(output_file)
             .arg("-no-pass");
 
-        match cmd.output().await {
-            Ok(out) if out.status.success() => {
+        match timeout(Duration::from_secs(60), cmd.output()).await {
+            Err(_) => continue,
+            Ok(Err(_)) => continue,
+            Ok(Ok(out)) if out.status.success() => {
                 findings.push(AuthFinding {
                     id: "AUTH-ASREP-HASHES".to_string(),
                     severity: "high".to_string(),
@@ -881,7 +903,6 @@ async fn attempt_impacket_asrep(
                 return;
             }
             Ok(_) => continue,
-            Err(_) => continue,
         }
     }
 }
@@ -911,7 +932,7 @@ async fn attempt_pre2k_tgt(
         for bin in bins {
             let mut cmd = Command::new(bin);
             cmd.arg("-dc-ip").arg(target).arg(&principal);
-            if let Ok(out) = cmd.output().await {
+            if let Ok(Ok(out)) = timeout(Duration::from_secs(30), cmd.output()).await {
                 if out.status.success() {
                     worked = true;
                     break;
@@ -2079,11 +2100,13 @@ async fn attempt_certipy_find(
             .arg(target)
             .arg("-vulnerable")
             .arg("-stdout")
-            .output()
-            .await;
+            .output();
 
-        match out {
-            Ok(out) if out.status.success() => {
+        match timeout(Duration::from_secs(90), out).await {
+            Err(_) => continue,
+            Ok(Err(e)) if e.kind() == ErrorKind::NotFound => continue,
+            Ok(Err(_)) => continue,
+            Ok(Ok(out)) if out.status.success() => {
                 let stdout = String::from_utf8_lossy(&out.stdout).to_string();
                 let trimmed = stdout.trim().to_string();
                 let preview = if trimmed.is_empty() {
@@ -2110,8 +2133,6 @@ async fn attempt_certipy_find(
                 return;
             }
             Ok(_) => continue,
-            Err(e) if e.kind() == ErrorKind::NotFound => continue,
-            Err(_) => continue,
         }
     }
 }

@@ -83,7 +83,7 @@ async fn run_password(
     output_dir: &str,
 ) -> Result<(bool, bool)> {
     output::info("BloodHound auth method: password");
-    run_with_candidates(
+    let (ok, found) = run_with_candidates(
         target,
         domain,
         username,
@@ -92,7 +92,22 @@ async fn run_password(
         &[("-p", password)],
         &[],
     )
-    .await
+    .await?;
+    if ok || !found {
+        return Ok((ok, found));
+    }
+    output::info("Retrying BloodHound password method with --dns-tcp");
+    let (ok2, found2) = run_with_candidates(
+        target,
+        domain,
+        username,
+        collection,
+        output_dir,
+        &[("-p", password)],
+        &["--dns-tcp"],
+    )
+    .await?;
+    Ok((ok || ok2, found || found2))
 }
 
 async fn run_ntlm(
@@ -109,7 +124,7 @@ async fn run_ntlm(
     } else {
         format!("aad3b435b51404eeaad3b435b51404ee:{}", ntlm_hash)
     };
-    run_with_candidates(
+    let (ok, found) = run_with_candidates(
         target,
         domain,
         username,
@@ -118,7 +133,22 @@ async fn run_ntlm(
         &[("--hashes", &hashes)],
         &[],
     )
-    .await
+    .await?;
+    if ok || !found {
+        return Ok((ok, found));
+    }
+    output::info("Retrying BloodHound NTLM method with --dns-tcp");
+    let (ok2, found2) = run_with_candidates(
+        target,
+        domain,
+        username,
+        collection,
+        output_dir,
+        &[("--hashes", &hashes)],
+        &["--dns-tcp"],
+    )
+    .await?;
+    Ok((ok || ok2, found || found2))
 }
 
 async fn run_kerberos(
@@ -129,7 +159,7 @@ async fn run_kerberos(
     output_dir: &str,
 ) -> Result<(bool, bool)> {
     output::info("BloodHound auth method: Kerberos (-k)");
-    run_with_candidates(
+    let (ok, found) = run_with_candidates(
         target,
         domain,
         username,
@@ -138,7 +168,22 @@ async fn run_kerberos(
         &[],
         &["-k"],
     )
-    .await
+    .await?;
+    if ok || !found {
+        return Ok((ok, found));
+    }
+    output::info("Retrying BloodHound Kerberos method with --dns-tcp");
+    let (ok2, found2) = run_with_candidates(
+        target,
+        domain,
+        username,
+        collection,
+        output_dir,
+        &[],
+        &["-k", "--dns-tcp"],
+    )
+    .await?;
+    Ok((ok || ok2, found || found2))
 }
 
 fn base_cmd(

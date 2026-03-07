@@ -76,8 +76,11 @@ pub async fn run(target: &str) -> Result<Option<String>> {
 /// For IP targets, this performs reverse DNS and strips the host label.
 /// For FQDN targets, this strips the first label directly.
 pub async fn discover_domain_from_target(target: &str) -> Option<String> {
-    if let Some(domain) = domain_from_hostname(target) {
-        return Some(domain);
+    // If target is an IP literal, don't treat dot-separated octets as a hostname.
+    if target.parse::<std::net::IpAddr>().is_err() {
+        if let Some(domain) = domain_from_hostname(target) {
+            return Some(domain);
+        }
     }
 
     let resolver = TokioAsyncResolver::tokio(ResolverConfig::default(), ResolverOpts::default());
@@ -89,14 +92,81 @@ pub async fn discover_domain_from_target(target: &str) -> Option<String> {
     domain_from_hostname(hostname.trim_end_matches('.'))
 }
 
-/// Convert an FQDN like dc01.corp.local to corp.local.
-pub fn domain_from_hostname(hostname: &str) -> Option<String> {
-    let parts: Vec<&str> = hostname.split('.').filter(|p| !p.is_empty()).collect();
-    if parts.len() >= 2 {
-        Some(parts[1..].join("."))
+pub fn is_valid_domain_name(value: &str) -> bool {
+    let v = value.trim().trim_matches('.').to_ascii_lowercase();
+    if v.is_empty() {
+        return false;
+    }
+    if v.parse::<std::net::IpAddr>().is_ok() {
+        return false;
+    }
+    if !v.chars().any(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    let labels: Vec<&str> = v.split('.').collect();
+    if labels.iter().any(|l| l.is_empty()) {
+        return false;
+    }
+    for label in labels {
+        if label.len() > 63 {
+            return false;
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return false;
+        }
+        if !label
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn normalize_domain_name(value: &str) -> Option<String> {
+    let v = value.trim().trim_matches('.').to_ascii_lowercase();
+    if is_valid_domain_name(&v) {
+        Some(v)
     } else {
         None
     }
+}
+
+/// Convert hostname/FQDN to a likely AD DNS domain:
+/// - `dc01.pirate.htb` -> `pirate.htb`
+/// - `pirate.htb` -> `pirate.htb`
+/// - `localhost` -> None
+pub fn domain_from_hostname(hostname: &str) -> Option<String> {
+    let h = hostname.trim().trim_matches('.').to_ascii_lowercase();
+    let parts: Vec<&str> = h.split('.').filter(|p| !p.is_empty()).collect();
+    let candidate = match parts.len() {
+        0 | 1 => return None,
+        2 => h,
+        _ => parts[1..].join("."),
+    };
+    normalize_domain_name(&candidate)
+}
+
+/// Prefer a better domain candidate.
+/// - invalid current -> replace with valid candidate
+/// - if both valid and candidate is more specific (`pirate.htb` over `htb`) -> replace
+pub fn should_replace_domain(current: &str, candidate: &str) -> bool {
+    let Some(cur) = normalize_domain_name(current) else {
+        return true;
+    };
+    let Some(cand) = normalize_domain_name(candidate) else {
+        return false;
+    };
+    if cur == cand {
+        return false;
+    }
+    let cur_labels = cur.split('.').count();
+    let cand_labels = cand.split('.').count();
+    if cand_labels > cur_labels && cand.ends_with(&format!(".{}", cur)) {
+        return true;
+    }
+    false
 }
 
 async fn check_open_recursion(target: &str) {
