@@ -79,6 +79,7 @@ Based on open ports and available creds/data, aydee attempts:
 - DNS discovery and domain inference
 - LDAP/GC unauth recon and user/domain harvesting
 - SMB unauth checks (NTLM info, signing, SMBv1, null session) and authenticated share recon
+- WinRM authenticated credential validation checks (when 5985/5986 are open)
 - RPC endpoint surface checks
 - Kerberos user enumeration
 - Credential attack paths (including AS-REP / Kerberoast tooling integrations when possible)
@@ -96,6 +97,8 @@ Artifacts (reports, hashes, tickets, tool outputs) are written under that run di
 
 - Domain is auto-discovered from target identity, DNS, LDAP, and SMB where possible.
 - If Kerberos-related actions are in scope, aydee attempts startup clock sync unless disabled.
+- Kerberos auth paths are only used when `-k/--kerberos` is explicitly provided. A ccache alone will not auto-enable Kerberos mode.
+- When authenticated abuse indicators are detected, aydee can prompt (default `N`) to attempt a temporary fake-SPN write + roast + cleanup flow.
 - External tooling availability (e.g., impacket/bloodhound-python/certipy/nxc) affects which sub-steps can execute.
 
 ## Legal

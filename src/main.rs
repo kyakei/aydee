@@ -11,6 +11,7 @@ mod report;
 mod rpc;
 mod scanner;
 mod smb;
+mod winrm;
 
 use anyhow::{Context, Result};
 use clap::builder::styling::{AnsiColor, Effects, Styles};
@@ -108,8 +109,8 @@ async fn main() -> Result<()> {
     if let Some(ref domain) = args.domain {
         output::info(&format!("Domain: {}", domain.white().bold()));
     }
-    let kerberos_auth_effective =
-        args.kerberos_auth || args.ccache.is_some() || existing_ccache.is_some();
+    let kerberos_ticket_present = args.ccache.is_some() || existing_ccache.is_some();
+    let kerberos_auth_enabled = args.kerberos_auth;
 
     if let Some(ref ccache) = args.ccache {
         let cache_value = if ccache.contains(':') {
@@ -126,11 +127,14 @@ async fn main() -> Result<()> {
     }
 
     if args.username.is_some()
-        && (args.password.is_some() || args.ntlm.is_some() || kerberos_auth_effective)
+        && (args.password.is_some() || args.ntlm.is_some() || kerberos_auth_enabled)
     {
         output::success("Authenticated mode enabled");
     } else {
         output::info("Authenticated mode not enabled (no credentials provided)");
+    }
+    if kerberos_ticket_present && !kerberos_auth_enabled {
+        output::info("Kerberos ticket cache detected, but -k/--kerberos not set (using password/hash paths only)");
     }
 
     clock::maybe_fix_clock_skew(&args.target, !args.no_fix_clock_skew).await;
@@ -149,7 +153,7 @@ async fn main() -> Result<()> {
 
     // Show available recon entry points based on discovered ports/credentials
     let auth_enabled = args.username.is_some()
-        && (args.password.is_some() || args.ntlm.is_some() || kerberos_auth_effective);
+        && (args.password.is_some() || args.ntlm.is_some() || kerberos_auth_enabled);
     print_entry_points(&open_ports, auth_enabled);
 
     // Track discovered domain + usernames across modules
@@ -158,6 +162,7 @@ async fn main() -> Result<()> {
     let mut auth_findings: Vec<auth_recon::AuthFinding> = Vec::new();
     let mut ldap_auth_ok = false;
     let mut smb_auth_ok = false;
+    let mut winrm_auth_ok = false;
     let mut bloodhound_ok = false;
     let mut modules_run: Vec<&str> = Vec::new();
 
@@ -217,7 +222,7 @@ async fn main() -> Result<()> {
                     "No domain available for authenticated LDAP recon bundle; skipping auth LDAP findings",
                 );
             }
-        } else if args.username.is_some() && (args.ntlm.is_some() || kerberos_auth_effective) {
+        } else if args.username.is_some() && (args.ntlm.is_some() || kerberos_auth_enabled) {
             output::warning(
                 "Authenticated LDAP recon currently requires --password; skipping auth LDAP feature",
             );
@@ -253,7 +258,7 @@ async fn main() -> Result<()> {
                 user,
                 args.password.as_deref(),
                 args.ntlm.as_deref(),
-                kerberos_auth_effective,
+                kerberos_auth_enabled,
                 &no_tags,
             )
             .await?;
@@ -308,7 +313,7 @@ async fn main() -> Result<()> {
             args.username.as_deref(),
             args.password.as_deref(),
             args.ntlm.as_deref(),
-            kerberos_auth_effective,
+            kerberos_auth_enabled,
             &all_users,
         )
         .await;
@@ -321,6 +326,21 @@ async fn main() -> Result<()> {
     // BloodHound collection (if credentials available)
     let auth_domain = discovered_domain.as_deref();
 
+    // WinRM credential validation/checks (if WinRM port open and credentials provided)
+    if open_ports.contains(&5985) || open_ports.contains(&5986) {
+        if let Some(user) = args.username.as_deref() {
+            winrm_auth_ok = winrm::run_authenticated(
+                &args.target,
+                user,
+                args.password.as_deref(),
+                args.ntlm.as_deref(),
+                kerberos_auth_enabled,
+            )
+            .await?;
+            modules_run.push("WinRM");
+        }
+    }
+
     if let (Some(user), Some(domain)) = (args.username.as_deref(), auth_domain) {
         bloodhound_ok = bloodhound::run_collection(
             &args.target,
@@ -328,7 +348,7 @@ async fn main() -> Result<()> {
             user,
             args.password.as_deref(),
             args.ntlm.as_deref(),
-            kerberos_auth_effective,
+            kerberos_auth_enabled,
             &args.collection,
         )
         .await?;
@@ -336,7 +356,7 @@ async fn main() -> Result<()> {
     } else if args.username.is_some()
         || args.password.is_some()
         || args.ntlm.is_some()
-        || kerberos_auth_effective
+        || kerberos_auth_enabled
     {
         output::warning(
             "Auth creds partially provided or domain unresolved — skipping BloodHound collection",
@@ -377,6 +397,10 @@ async fn main() -> Result<()> {
         output::section("CREDENTIAL VALIDATION");
         output::kv("LDAP (389/636)", if ldap_auth_ok { "working" } else { "not confirmed" });
         output::kv("SMB (445/139)", if smb_auth_ok { "working" } else { "not confirmed" });
+        output::kv(
+            "WinRM (5985/5986)",
+            if winrm_auth_ok { "working" } else { "not confirmed" },
+        );
         output::kv(
             "BloodHound collection",
             if bloodhound_ok { "working" } else { "not confirmed" },
@@ -478,6 +502,9 @@ fn print_entry_points(open_ports: &[u16], auth_enabled: bool) {
     }
     if open_ports.iter().any(|p| matches!(*p, 80 | 443 | 8080 | 8443)) {
         output::kv("HTTP/S", "AD CS ESC8 relay precondition checks (/certsrv)");
+    }
+    if open_ports.iter().any(|p| matches!(*p, 5985 | 5986)) {
+        output::kv("WinRM", "credential validation and remote management auth checks");
     }
     if open_ports.contains(&88) {
         output::kv("Kerberos", "user enum, AS-REP roastable and pre2k-style machine account attempts");

@@ -3,6 +3,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::Command;
+use tokio::time::{timeout, Duration};
 
 use crate::auth_recon::AuthFinding;
 use crate::output;
@@ -404,8 +405,13 @@ async fn run_getuserspns(target: &str, args: Vec<String>) -> Option<(String, Str
     for bin in bins {
         let mut cmd = Command::new(bin);
         cmd.args(&args).stdin(Stdio::null());
-        match cmd.output().await {
-            Ok(out) if out.status.success() => {
+        match timeout(Duration::from_secs(60), cmd.output()).await {
+            Err(_) => {
+                output::warning(&format!("{} timed out after 60s (skipping method)", bin));
+                continue;
+            }
+            Ok(Err(_)) => continue,
+            Ok(Ok(out)) if out.status.success() => {
                 let mut text = String::new();
                 text.push_str(&String::from_utf8_lossy(&out.stdout));
                 text.push('\n');
@@ -414,7 +420,6 @@ async fn run_getuserspns(target: &str, args: Vec<String>) -> Option<(String, Str
                 return Some((bin.to_string(), text));
             }
             Ok(_) => continue,
-            Err(_) => continue,
         }
     }
     None
@@ -616,8 +621,13 @@ async fn run_getnpusers(args: Vec<String>) -> Option<(String, String)> {
     for bin in bins {
         let mut cmd = Command::new(bin);
         cmd.args(&args).stdin(Stdio::null());
-        match cmd.output().await {
-            Ok(out) if out.status.success() => {
+        match timeout(Duration::from_secs(60), cmd.output()).await {
+            Err(_) => {
+                output::warning(&format!("{} timed out after 60s (skipping method)", bin));
+                continue;
+            }
+            Ok(Err(_)) => continue,
+            Ok(Ok(out)) if out.status.success() => {
                 let mut text = String::new();
                 text.push_str(&String::from_utf8_lossy(&out.stdout));
                 text.push('\n');
@@ -625,7 +635,6 @@ async fn run_getnpusers(args: Vec<String>) -> Option<(String, String)> {
                 return Some((bin.to_string(), text));
             }
             Ok(_) => continue,
-            Err(_) => continue,
         }
     }
     None
@@ -656,7 +665,7 @@ async fn attempt_pre2k_gettgt(
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .stdin(Stdio::null());
-            if let Ok(out) = cmd.output().await {
+            if let Ok(Ok(out)) = timeout(Duration::from_secs(30), cmd.output()).await {
                 if out.status.success() {
                     worked = true;
                     break;

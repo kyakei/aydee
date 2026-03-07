@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::io::ErrorKind;
 use tokio::process::Command;
+use tokio::time::{timeout, Duration};
 
 use crate::output;
 
@@ -184,8 +185,21 @@ async fn run_with_candidates(
             cmd.arg(f);
         }
 
-        match cmd.output().await {
-            Ok(out) => {
+        match timeout(Duration::from_secs(120), cmd.output()).await {
+            Err(_) => {
+                found_any = true;
+                output::warning(&format!("{} method timed out after 120s", bin));
+                continue;
+            }
+            Ok(Err(e)) => {
+                if e.kind() == ErrorKind::NotFound {
+                    continue;
+                }
+                output::warning(&format!("Could not run {} ({})", bin, e));
+                found_any = true;
+                continue;
+            }
+            Ok(Ok(out)) => {
                 found_any = true;
                 if out.status.success() {
                     output::success(&format!("{} method succeeded", bin));
@@ -200,13 +214,6 @@ async fn run_with_candidates(
                 } else if !stdout.trim().is_empty() {
                     output::kv("stdout", stdout.trim());
                 }
-            }
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                continue;
-            }
-            Err(e) => {
-                output::warning(&format!("Could not run {} ({})", bin, e));
-                found_any = true;
             }
         }
     }

