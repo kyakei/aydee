@@ -240,7 +240,7 @@ async fn run_with_candidates(
     kv_args: &[(&str, &str)],
     flag_args: &[&str],
 ) -> Result<(bool, bool)> {
-    let bins = ["bloodhound-python", "bloodhound-ce-python"];
+    let bins = ["rusthound-ce","bloodhound-python", "bloodhound-ce-python"];
     let mut found_any = false;
 
     for bin in bins {
