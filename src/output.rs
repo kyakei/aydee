@@ -14,7 +14,7 @@ pub fn banner() {
     println!(
         "  {} {}\n",
         "AyDee - Active Directory Enumeration Tool".white().bold(),
-        "v0.1.0".bright_black()
+        "v0.2.0".bright_black()
     );
 }
 
