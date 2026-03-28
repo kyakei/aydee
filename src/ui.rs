@@ -20,6 +20,18 @@ pub fn is_verbose() -> bool {
     VERBOSE.load(Ordering::Relaxed)
 }
 
+// ── Quiet flag ─────────────────────────────────────────────────────────────
+
+static QUIET: AtomicBool = AtomicBool::new(false);
+
+pub fn set_quiet(q: bool) {
+    QUIET.store(q, Ordering::Relaxed);
+}
+
+pub fn is_quiet() -> bool {
+    QUIET.load(Ordering::Relaxed)
+}
+
 /// Print only when -v is set. Prefixed with dim [DBG].
 pub fn verbose(msg: &str) {
     if is_verbose() {
@@ -48,6 +60,9 @@ pub fn verbose_output(label: &str, output: &str) {
 // ── Banner ──────────────────────────────────────────────────────────────────
 
 pub fn banner() {
+    if is_quiet() {
+        return;
+    }
     let art = r#"
       ██████╗ ██╗ ██╗ ██████╗ ██████╗ ██████╗
      ██╔══██╗╚██╗ ██╔╝██╔══██╗██╔═══╝ ██╔═══╝
@@ -72,6 +87,9 @@ pub fn banner() {
 // ── Target info box ─────────────────────────────────────────────────────────
 
 pub fn target_box(target: &str, domain: Option<&str>, user: Option<&str>, mode: &str) {
+    if is_quiet() {
+        return;
+    }
     let border = "│".bright_black();
     let top = format!(
         "  {}",
@@ -121,6 +139,9 @@ pub fn target_box(target: &str, domain: Option<&str>, user: Option<&str>, mode: 
 // ── Section headers ─────────────────────────────────────────────────────────
 
 pub fn section(name: &str) {
+    if is_quiet() {
+        return;
+    }
     println!();
     let line = "━".repeat(50 - name.len().min(40));
     println!(
@@ -138,6 +159,9 @@ pub fn success(msg: &str) {
 }
 
 pub fn info(msg: &str) {
+    if is_quiet() {
+        return;
+    }
     println!("  {} {}", "[*]".blue().bold(), msg);
 }
 
@@ -152,6 +176,9 @@ pub fn fail(msg: &str) {
 // ── Key-value output ────────────────────────────────────────────────────────
 
 pub fn kv(key: &str, value: &str) {
+    if is_quiet() {
+        return;
+    }
     let val = compact_value(value, 90);
     println!(
         "    {}: {}",
@@ -399,7 +426,7 @@ pub fn risk_score_display(score: &RiskScore) {
 // ── Entry points ────────────────────────────────────────────────────────────
 
 pub fn entry_points(open_ports: &[u16]) {
-    if open_ports.is_empty() {
+    if is_quiet() || open_ports.is_empty() {
         return;
     }
 
@@ -434,6 +461,9 @@ pub fn entry_points(open_ports: &[u16]) {
 // ── Stage summary line ──────────────────────────────────────────────────────
 
 pub fn stage_done(name: &str, detail: &str, elapsed: &str) {
+    if is_quiet() {
+        return;
+    }
     println!(
         "  {} {} {} {}",
         "✓".green().bold(),
@@ -444,6 +474,9 @@ pub fn stage_done(name: &str, detail: &str, elapsed: &str) {
 }
 
 pub fn stage_skip(name: &str, reason: &str) {
+    if is_quiet() {
+        return;
+    }
     println!(
         "  {} {} {}",
         "○".bright_black(),

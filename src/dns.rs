@@ -18,6 +18,7 @@ const SRV_QUERIES: &[(&str, &str)] = &[
     ("_kerberos._tcp.dc._msdcs", "KDC (MSDCS)"),
     ("_ldap._tcp.ForestDnsZones", "Forest DNS Zones"),
     ("_ldap._tcp.DomainDnsZones", "Domain DNS Zones"),
+    ("_mssql._tcp", "MSSQL Server"),
 ];
 
 /// Run DNS enumeration against the target.
@@ -113,6 +114,12 @@ pub async fn run(
         }
     }
 
+    // Step 6: DNS dynamic update check
+    spin.set_message("checking DNS dynamic updates...");
+    if let Some(finding) = check_dns_dynamic_update(target, domain).await {
+        result.findings.push(finding);
+    }
+
     ui::finish_spinner(&spin, &format!("{} SRV records found", total_records));
     ui::stage_done("DNS", &format!("{} records", total_records), &timer.elapsed_pretty());
 
@@ -195,4 +202,78 @@ async fn attempt_zone_transfer(target: &str, domain: &str) -> Result<bool> {
         .count();
 
     Ok(record_count > 2) // More than just SOA records
+}
+
+/// Check if the DNS server accepts unauthenticated dynamic updates.
+async fn check_dns_dynamic_update(target: &str, domain: &str) -> Option<Finding> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let test_name = format!("_aydee-dnstest-{}.{}", ts, domain);
+
+    // nsupdate script: add a harmless TXT record, then immediately delete it
+    let script = format!(
+        "server {}\nzone {}\nupdate add {} 10 TXT \"aydee-dynamic-update-test\"\nsend\nupdate delete {} TXT\nsend\n",
+        target, domain, test_name, test_name
+    );
+
+    let tmp_path = format!("/tmp/aydee_nsupdate_{}.txt", ts);
+    if tokio::fs::write(&tmp_path, &script).await.is_err() {
+        return None;
+    }
+
+    let out = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::process::Command::new("nsupdate")
+            .arg(&tmp_path)
+            .output(),
+    )
+    .await;
+
+    let _ = tokio::fs::remove_file(&tmp_path).await;
+
+    match out {
+        Ok(Ok(output)) => {
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            ui::verbose_output("nsupdate", &combined);
+
+            if output.status.success() {
+                ui::warning("DNS dynamic updates allowed without authentication!");
+                Some(
+                    Finding::new(
+                        "dns",
+                        "DNS-003",
+                        Severity::High,
+                        "Unauthenticated DNS dynamic updates permitted",
+                    )
+                    .with_description(
+                        "The DNS server accepts dynamic updates without authentication, allowing attackers to add/modify DNS records for MitM attacks",
+                    )
+                    .with_recommendation(
+                        "Configure DNS zones to require secure dynamic updates only",
+                    )
+                    .with_mitre("T1557.001"),
+                )
+            } else {
+                let lower = combined.to_lowercase();
+                if lower.contains("refused") {
+                    ui::info("DNS dynamic updates properly restricted");
+                }
+                None
+            }
+        }
+        Ok(Err(_)) => {
+            ui::verbose("nsupdate not found — skipping DNS dynamic update check");
+            None
+        }
+        Err(_) => {
+            ui::verbose("nsupdate timed out");
+            None
+        }
+    }
 }

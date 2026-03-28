@@ -1,8 +1,9 @@
 use anyhow::Result;
+use ldap3::controls::RawControl;
 use ldap3::{LdapConnAsync, LdapConnSettings, Scope, SearchEntry};
 use std::time::Duration;
 
-use crate::types::{Finding, LdapInfo, ModuleResult, Severity, StageTimer};
+use crate::types::{DomainPasswordPolicy, Finding, LdapInfo, ModuleResult, Severity, StageTimer};
 use crate::ui;
 
 // ── Unauthenticated LDAP ────────────────────────────────────────────────────
@@ -384,6 +385,40 @@ pub async fn run_authenticated(
         Err(e) => ui::warning(&format!("User collection failed: {}", e)),
     }
 
+    // ── Domain password policy ──────────────────────────────────────────
+    if should_run("policy") {
+        spin.set_message("extracting domain password policy...");
+        if let Some(policy) = collect_domain_password_policy(&mut ldap, &base).await {
+            ui::info("Domain Password Policy:");
+            ui::kv("  Min Password Length", &policy.min_pwd_length.to_string());
+            ui::kv("  Lockout Threshold", &format!("{} attempts", policy.lockout_threshold));
+            ui::kv("  Lockout Observation Window", &format!("{} min", policy.lockout_observation_window_min));
+            ui::kv("  Lockout Duration", &format!("{} min", policy.lockout_duration_min));
+            ui::kv("  Complexity Required", &policy.complexity_enabled.to_string());
+            ui::kv("  Password History", &policy.pwd_history_length.to_string());
+            if policy.lockout_threshold == 0 {
+                ui::warning("No account lockout policy — spray freely");
+                let finding = Finding::new(
+                    "ldap", "POLICY-001", Severity::Medium,
+                    "No account lockout threshold configured",
+                )
+                .with_description("The domain has no account lockout policy, allowing unlimited password attempts")
+                .with_recommendation("Set lockoutThreshold to at least 5 and configure lockout duration")
+                .with_mitre("T1110.003");
+                result.findings.push(finding);
+            }
+            if policy.min_pwd_length < 8 {
+                let finding = Finding::new(
+                    "ldap", "POLICY-002", Severity::Medium,
+                    &format!("Weak minimum password length: {}", policy.min_pwd_length),
+                )
+                .with_recommendation("Set minimum password length to at least 14 characters");
+                result.findings.push(finding);
+            }
+            result.password_policy = Some(policy);
+        }
+    }
+
     // ── Kerberoastable SPNs ─────────────────────────────────────────────
     if should_run("kerberoast") {
         spin.set_message("checking Kerberoastable accounts...");
@@ -456,10 +491,58 @@ pub async fn run_authenticated(
         collect_shadow_credentials(&mut ldap, &base, &mut result).await;
     }
 
+    // ── gMSA readability ──────────────────────────────────────────────
+    if should_run("gmsa") {
+        spin.set_message("checking gMSA readability...");
+        collect_gmsa(&mut ldap, &base, &mut result).await;
+    }
+
     // ── User descriptions (password hints) ──────────────────────────────
     if should_run("user-desc") {
         spin.set_message("checking user descriptions...");
         collect_user_descriptions(&mut ldap, &base, &mut result).await;
+    }
+
+    // ── Deleted but recoverable objects ─────────────────────────────────
+    if should_run("deleted") {
+        spin.set_message("checking deleted objects (Recycle Bin)...");
+        collect_deleted_objects(&mut ldap, &base, &mut result).await;
+    }
+
+    // ── Pre-Windows 2000 Compatible Access ──────────────────────────────
+    if should_run("pre2000") {
+        spin.set_message("checking Pre-Windows 2000 group...");
+        collect_pre2000_group(&mut ldap, &base, &mut result).await;
+    }
+
+    // ── Inactive / stale accounts ───────────────────────────────────────
+    if should_run("inactive") {
+        spin.set_message("checking inactive accounts...");
+        collect_inactive_accounts(&mut ldap, &base, &mut result).await;
+    }
+
+    // ── Privileged group recursive membership ───────────────────────────
+    if should_run("privgroups") {
+        spin.set_message("enumerating privileged groups...");
+        collect_privileged_groups(&mut ldap, &base, &mut result).await;
+    }
+
+    // ── AdminSDHolder ───────────────────────────────────────────────────
+    if should_run("adminsdholder") {
+        spin.set_message("checking AdminSDHolder...");
+        collect_adminsdholder(&mut ldap, &base, &mut result).await;
+    }
+
+    // ── SID History ─────────────────────────────────────────────────────
+    if should_run("sidhistory") {
+        spin.set_message("checking SID history...");
+        collect_sid_history(&mut ldap, &base, &mut result).await;
+    }
+
+    // ── Service account heuristics ──────────────────────────────────────
+    if should_run("svc-accounts") {
+        spin.set_message("identifying service accounts...");
+        collect_service_accounts(&mut ldap, &base, &mut result).await;
     }
 
     let _ = ldap.unbind().await;
@@ -613,6 +696,90 @@ async fn collect_delegation(ldap: &mut ldap3::Ldap, base: &str, result: &mut Mod
         }
     }
 
+    // Constrained delegation (msDS-AllowedToDelegateTo)
+    let filter = "(msDS-AllowedToDelegateTo=*)";
+    if let Ok((rs, _)) = ldap
+        .search(
+            base,
+            Scope::Subtree,
+            filter,
+            vec!["sAMAccountName", "msDS-AllowedToDelegateTo", "userAccountControl"],
+        )
+        .await
+        .and_then(|r| r.success())
+    {
+        let mut constrained = Vec::new();
+        let mut protocol_transition = Vec::new();
+
+        for entry in rs {
+            let se = SearchEntry::construct(entry);
+            let name = se
+                .attrs
+                .get("sAMAccountName")
+                .and_then(|v| v.first())
+                .cloned()
+                .unwrap_or_default();
+            let delegates_to = se
+                .attrs
+                .get("msDS-AllowedToDelegateTo")
+                .cloned()
+                .unwrap_or_default();
+            let uac: u32 = se
+                .attrs
+                .get("userAccountControl")
+                .and_then(|v| v.first())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+
+            let entry_str = format!("{} → {}", name, delegates_to.join(", "));
+
+            // TRUSTED_TO_AUTH_FOR_DELEGATION = 0x1000000
+            if uac & 0x1000000 != 0 {
+                protocol_transition.push(entry_str);
+            } else {
+                constrained.push(entry_str);
+            }
+        }
+
+        if !constrained.is_empty() {
+            ui::info(&format!(
+                "{} constrained delegation entries",
+                constrained.len()
+            ));
+            for c in &constrained {
+                ui::kv("  Constrained", c);
+            }
+        }
+
+        if !protocol_transition.is_empty() {
+            ui::warning(&format!(
+                "{} constrained delegation with protocol transition (S4U2Self)",
+                protocol_transition.len()
+            ));
+            for p in &protocol_transition {
+                ui::kv("  Protocol Transition", p);
+            }
+            let finding = Finding::new(
+                "ldap",
+                "DELEG-002",
+                Severity::High,
+                &format!(
+                    "{} account(s) with constrained delegation + protocol transition",
+                    protocol_transition.len()
+                ),
+            )
+            .with_description(
+                "Accounts with TRUSTED_TO_AUTH_FOR_DELEGATION can perform S4U2Self to obtain tickets for any user, then S4U2Proxy to the allowed services — enabling impersonation without user interaction",
+            )
+            .with_evidence(&protocol_transition.join("\n"))
+            .with_recommendation(
+                "Remove TRUSTED_TO_AUTH_FOR_DELEGATION where not needed; prefer RBCD",
+            )
+            .with_mitre("T1550.003");
+            result.findings.push(finding);
+        }
+    }
+
     // RBCD (msDS-AllowedToActOnBehalfOfOtherIdentity)
     let filter = "(msDS-AllowedToActOnBehalfOfOtherIdentity=*)";
     if let Ok((rs, _)) = ldap
@@ -718,12 +885,28 @@ async fn collect_trusts(ldap: &mut ldap3::Ldap, base: &str, result: &mut ModuleR
 async fn collect_adcs_templates(ldap: &mut ldap3::Ldap, base: &str, result: &mut ModuleResult) {
     let config_nc = base.find("DC=").map(|_| {
         let parts: Vec<&str> = base.split(',').collect();
-        let dc_parts: Vec<&str> = parts.iter().filter(|p| p.starts_with("DC=")).copied().collect();
+        let dc_parts: Vec<&str> = parts
+            .iter()
+            .filter(|p| p.starts_with("DC="))
+            .copied()
+            .collect();
         format!("CN=Configuration,{}", dc_parts.join(","))
     });
 
     let Some(config_base) = config_nc else { return };
-    let templates_base = format!("CN=Certificate Templates,CN=Public Key Services,CN=Services,{}", config_base);
+    let templates_base = format!(
+        "CN=Certificate Templates,CN=Public Key Services,CN=Services,{}",
+        config_base
+    );
+
+    // Well-known EKU OIDs
+    const CLIENT_AUTH: &str = "1.3.6.1.5.5.7.3.2";
+    const PKINIT: &str = "1.3.6.1.5.2.3.4";
+    const SMART_CARD: &str = "1.3.6.1.4.1.311.20.2.2";
+    const ANY_PURPOSE: &str = "2.5.29.37.0";
+    const CERT_REQUEST_AGENT: &str = "1.3.6.1.4.1.311.20.2.1";
+    // SubAltName flag
+    const CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT: u32 = 0x00000001;
 
     let filter = "(objectClass=pKICertificateTemplate)";
     if let Ok((rs, _)) = ldap
@@ -737,15 +920,28 @@ async fn collect_adcs_templates(ldap: &mut ldap3::Ldap, base: &str, result: &mut
                 "msPKI-Enrollment-Flag",
                 "pKIExtendedKeyUsage",
                 "msPKI-RA-Signature",
+                "nTSecurityDescriptor",
+                "msPKI-Template-Schema-Version",
             ],
         )
-        .await.and_then(|r| r.success())
+        .await
+        .and_then(|r| r.success())
     {
-        let mut vulnerable_templates = Vec::new();
+        let mut esc1 = Vec::new();
+        let mut esc2 = Vec::new();
+        let mut esc3 = Vec::new();
+        let mut esc4 = Vec::new();
+        let mut template_count = 0u32;
 
         for entry in rs {
             let se = SearchEntry::construct(entry);
-            let name = se.attrs.get("cn").and_then(|v| v.first()).cloned().unwrap_or_default();
+            template_count += 1;
+            let name = se
+                .attrs
+                .get("cn")
+                .and_then(|v| v.first())
+                .cloned()
+                .unwrap_or_default();
             let name_flag: u32 = se
                 .attrs
                 .get("msPKI-Certificate-Name-Flag")
@@ -758,33 +954,173 @@ async fn collect_adcs_templates(ldap: &mut ldap3::Ldap, base: &str, result: &mut
                 .and_then(|v| v.first())
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
+            let eku = se
+                .attrs
+                .get("pKIExtendedKeyUsage")
+                .cloned()
+                .unwrap_or_default();
 
-            // ESC1: ENROLLEE_SUPPLIES_SUBJECT flag + Client Auth EKU + no manager approval
-            let supplies_subject = name_flag & 1 != 0;
-            let eku = se.attrs.get("pKIExtendedKeyUsage").cloned().unwrap_or_default();
-            let has_client_auth = eku.iter().any(|e| e == "1.3.6.1.5.5.7.3.2" || e == "1.3.6.1.4.1.311.20.2.2");
+            let supplies_subject = name_flag & CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT != 0;
             let no_approval = ra_sig == 0;
+            let has_client_auth = eku.iter().any(|e| {
+                e == CLIENT_AUTH || e == PKINIT || e == SMART_CARD
+            });
+            let has_any_purpose = eku.iter().any(|e| e == ANY_PURPOSE) || eku.is_empty();
+            let has_enrollment_agent = eku.iter().any(|e| e == CERT_REQUEST_AGENT);
 
+            // ESC1: enrollee supplies subject + client auth EKU + no manager approval
             if supplies_subject && has_client_auth && no_approval {
-                vulnerable_templates.push(format!("{} (ESC1: enrollee supplies subject + client auth)", name));
+                esc1.push(name.clone());
+                ui::warning(&format!("  ESC1: {} — enrollee supplies subject + client auth", name));
+            }
+
+            // ESC2: any-purpose EKU or no EKU (SubCA) + no manager approval
+            if has_any_purpose && no_approval && !has_client_auth {
+                esc2.push(name.clone());
+                ui::warning(&format!("  ESC2: {} — any purpose / no EKU restrictions", name));
+            }
+
+            // ESC3: enrollment agent EKU + no approval
+            if has_enrollment_agent && no_approval {
+                esc3.push(name.clone());
+                ui::warning(&format!("  ESC3: {} — certificate request agent EKU", name));
+            }
+
+            // ESC4: check if we can read nTSecurityDescriptor (indicates we might have write access)
+            // Full ACL parsing requires binary SD parsing; flag templates where SD is readable as potential ESC4
+            if se.bin_attrs.contains_key("nTSecurityDescriptor") {
+                // We can read the SD — note it for manual review
+                esc4.push(name.clone());
             }
         }
 
-        if !vulnerable_templates.is_empty() {
-            for t in &vulnerable_templates {
-                ui::warning(t);
-            }
+        ui::info(&format!("{} certificate template(s) enumerated", template_count));
+
+        if !esc1.is_empty() {
             let finding = Finding::new(
                 "ldap",
-                "ADCS-001",
+                "ADCS-ESC1",
                 Severity::Critical,
-                &format!("{} vulnerable AD CS template(s) (ESC1)", vulnerable_templates.len()),
+                &format!("{} template(s) vulnerable to ESC1", esc1.len()),
             )
-            .with_description("Certificate templates allow enrollee to supply the subject name with Client Authentication EKU, enabling domain privilege escalation")
-            .with_evidence(&vulnerable_templates.join("\n"))
-            .with_recommendation("Remove ENROLLEE_SUPPLIES_SUBJECT flag, restrict enrollment permissions, or require manager approval")
+            .with_description(
+                "Templates allow enrollee to supply the subject name with Client Authentication EKU and no manager approval — enables domain privilege escalation via certificate impersonation",
+            )
+            .with_evidence(&esc1.join(", "))
+            .with_recommendation(
+                "Remove ENROLLEE_SUPPLIES_SUBJECT flag, restrict enrollment permissions, or require manager approval",
+            )
             .with_mitre("T1649");
             result.findings.push(finding);
+        }
+
+        if !esc2.is_empty() {
+            let finding = Finding::new(
+                "ldap",
+                "ADCS-ESC2",
+                Severity::High,
+                &format!("{} template(s) vulnerable to ESC2", esc2.len()),
+            )
+            .with_description(
+                "Templates have Any Purpose EKU or no EKU restrictions — can be used as subordinate CA or for any authentication purpose",
+            )
+            .with_evidence(&esc2.join(", "))
+            .with_recommendation(
+                "Restrict EKU to specific purposes; remove Any Purpose OID",
+            )
+            .with_mitre("T1649");
+            result.findings.push(finding);
+        }
+
+        if !esc3.is_empty() {
+            let finding = Finding::new(
+                "ldap",
+                "ADCS-ESC3",
+                Severity::High,
+                &format!("{} template(s) vulnerable to ESC3", esc3.len()),
+            )
+            .with_description(
+                "Templates have Certificate Request Agent EKU — allows enrolling on behalf of other users including admins",
+            )
+            .with_evidence(&esc3.join(", "))
+            .with_recommendation(
+                "Restrict enrollment agent templates to dedicated RA accounts; enable enrollment agent restrictions on the CA",
+            )
+            .with_mitre("T1649");
+            result.findings.push(finding);
+        }
+
+        if !esc4.is_empty() {
+            ui::verbose(&format!(
+                "ESC4 candidates (SD readable, review ACLs): {}",
+                esc4.join(", ")
+            ));
+        }
+    }
+
+    // ESC6: Check CA object for EDITF_ATTRIBUTESUBJECTALTNAME2
+    let ca_base = format!(
+        "CN=Enrollment Services,CN=Public Key Services,CN=Services,{}",
+        config_base
+    );
+    if let Ok((rs, _)) = ldap
+        .search(
+            &ca_base,
+            Scope::Subtree,
+            "(objectClass=pKIEnrollmentService)",
+            vec!["cn", "flags", "cACertificate", "certificateTemplates"],
+        )
+        .await
+        .and_then(|r| r.success())
+    {
+        for entry in rs {
+            let se = SearchEntry::construct(entry);
+            let ca_name = se
+                .attrs
+                .get("cn")
+                .and_then(|v| v.first())
+                .cloned()
+                .unwrap_or_default();
+            let flags: u32 = se
+                .attrs
+                .get("flags")
+                .and_then(|v| v.first())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+
+            // EDITF_ATTRIBUTESUBJECTALTNAME2 = 0x00040000
+            if flags & 0x00040000 != 0 {
+                ui::warning(&format!(
+                    "  ESC6: CA '{}' has EDITF_ATTRIBUTESUBJECTALTNAME2 enabled",
+                    ca_name
+                ));
+                let finding = Finding::new(
+                    "ldap",
+                    "ADCS-ESC6",
+                    Severity::Critical,
+                    &format!(
+                        "CA '{}' has EDITF_ATTRIBUTESUBJECTALTNAME2 — any template can specify SAN",
+                        ca_name
+                    ),
+                )
+                .with_description(
+                    "The CA has EDITF_ATTRIBUTESUBJECTALTNAME2 flag set, allowing ANY certificate request to specify an arbitrary Subject Alternative Name. This means even templates without ENROLLEE_SUPPLIES_SUBJECT can be abused for impersonation.",
+                )
+                .with_recommendation(
+                    "Disable EDITF_ATTRIBUTESUBJECTALTNAME2 on the CA: certutil -config 'CA' -setreg policy\\EditFlags -EDITF_ATTRIBUTESUBJECTALTNAME2",
+                )
+                .with_mitre("T1649");
+                result.findings.push(finding);
+            }
+
+            // Show enrolled templates
+            if let Some(templates) = se.attrs.get("certificateTemplates") {
+                ui::verbose(&format!(
+                    "CA '{}' enrolls: {}",
+                    ca_name,
+                    templates.join(", ")
+                ));
+            }
         }
     }
 }
@@ -913,42 +1249,138 @@ async fn collect_dcsync_heuristics(ldap: &mut ldap3::Ldap, base: &str, _result: 
 }
 
 async fn collect_laps(ldap: &mut ldap3::Ldap, base: &str, result: &mut ModuleResult) {
-    // Check if LAPS attributes are readable
-    let filter = "(&(objectCategory=computer)(ms-Mcs-AdmPwd=*))";
+    // Check LAPS v1 (legacy) attributes
+    let v1_filter = "(&(objectCategory=computer)(ms-Mcs-AdmPwd=*))";
+    let mut v1_readable = Vec::new();
     if let Ok((rs, _)) = ldap
         .search(
             base,
             Scope::Subtree,
-            filter,
-            vec!["sAMAccountName", "ms-Mcs-AdmPwd", "ms-Mcs-AdmPwdExpirationTime"],
+            v1_filter,
+            vec!["sAMAccountName", "ms-Mcs-AdmPwd"],
         )
-        .await.and_then(|r| r.success())
+        .await
+        .and_then(|r| r.success())
     {
-        let readable: Vec<String> = rs
-            .into_iter()
-            .filter_map(|e| {
-                let se = SearchEntry::construct(e);
-                if se.attrs.contains_key("ms-Mcs-AdmPwd") {
-                    se.attrs.get("sAMAccountName").and_then(|v| v.first().cloned())
-                } else {
-                    None
+        for e in rs {
+            let se = SearchEntry::construct(e);
+            if se.attrs.contains_key("ms-Mcs-AdmPwd") {
+                if let Some(name) = se.attrs.get("sAMAccountName").and_then(|v| v.first()) {
+                    v1_readable.push(name.clone());
                 }
-            })
-            .collect();
+            }
+        }
+    }
 
-        if !readable.is_empty() {
-            ui::warning(&format!("LAPS passwords readable for {} host(s)", readable.len()));
-            let finding = Finding::new(
-                "ldap",
-                "LAPS-001",
-                Severity::High,
-                &format!("LAPS passwords readable for {} computer(s)", readable.len()),
-            )
-            .with_description("Current credentials can read LAPS managed local admin passwords")
-            .with_evidence(&readable.join(", "))
-            .with_recommendation("Restrict LAPS read permissions to authorized admin groups only")
-            .with_mitre("T1555");
-            result.findings.push(finding);
+    if !v1_readable.is_empty() {
+        ui::warning(&format!(
+            "LAPS v1 passwords readable for {} host(s)",
+            v1_readable.len()
+        ));
+        let finding = Finding::new(
+            "ldap",
+            "LAPS-001",
+            Severity::High,
+            &format!(
+                "LAPS v1 passwords readable for {} computer(s)",
+                v1_readable.len()
+            ),
+        )
+        .with_description(
+            "Current credentials can read legacy LAPS (ms-Mcs-AdmPwd) local admin passwords",
+        )
+        .with_evidence(&v1_readable.join(", "))
+        .with_recommendation("Restrict LAPS read permissions; migrate to Windows LAPS (v2)")
+        .with_mitre("T1555");
+        result.findings.push(finding);
+    }
+
+    // Check LAPS v2 (Windows LAPS) attributes
+    let v2_filter =
+        "(&(objectCategory=computer)(|(msLAPS-Password=*)(msLAPS-EncryptedPassword=*)))";
+    let mut v2_readable = Vec::new();
+    let mut v2_encrypted = Vec::new();
+    if let Ok((rs, _)) = ldap
+        .search(
+            base,
+            Scope::Subtree,
+            v2_filter,
+            vec![
+                "sAMAccountName",
+                "msLAPS-Password",
+                "msLAPS-EncryptedPassword",
+            ],
+        )
+        .await
+        .and_then(|r| r.success())
+    {
+        for e in rs {
+            let se = SearchEntry::construct(e);
+            let name = se
+                .attrs
+                .get("sAMAccountName")
+                .and_then(|v| v.first())
+                .cloned()
+                .unwrap_or_default();
+            if se.attrs.contains_key("msLAPS-Password") {
+                v2_readable.push(name.clone());
+            }
+            if se.attrs.contains_key("msLAPS-EncryptedPassword") {
+                v2_encrypted.push(name);
+            }
+        }
+    }
+
+    if !v2_readable.is_empty() {
+        ui::warning(&format!(
+            "LAPS v2 cleartext passwords readable for {} host(s)",
+            v2_readable.len()
+        ));
+        let finding = Finding::new(
+            "ldap",
+            "LAPS-002",
+            Severity::High,
+            &format!(
+                "Windows LAPS v2 passwords readable for {} computer(s)",
+                v2_readable.len()
+            ),
+        )
+        .with_description(
+            "Current credentials can read Windows LAPS (msLAPS-Password) local admin passwords in cleartext",
+        )
+        .with_evidence(&v2_readable.join(", "))
+        .with_recommendation(
+            "Restrict LAPS read permissions; enable LAPS password encryption",
+        )
+        .with_mitre("T1555");
+        result.findings.push(finding);
+    }
+
+    if !v2_encrypted.is_empty() {
+        ui::info(&format!(
+            "LAPS v2 encrypted passwords visible for {} host(s) (encrypted — requires DSRM key to decrypt)",
+            v2_encrypted.len()
+        ));
+    }
+
+    // Summary
+    let total = v1_readable.len() + v2_readable.len();
+    if total == 0 {
+        // Check if LAPS is deployed at all
+        let any_laps = "(&(objectCategory=computer)(|(ms-Mcs-AdmPwdExpirationTime=*)(msLAPS-PasswordExpirationTime=*)))";
+        if let Ok((rs, _)) = ldap
+            .search(base, Scope::Subtree, any_laps, vec!["sAMAccountName"])
+            .await
+            .and_then(|r| r.success())
+        {
+            if rs.is_empty() {
+                ui::info("LAPS does not appear to be deployed in this domain");
+            } else {
+                ui::success(&format!(
+                    "LAPS deployed on {} host(s) — passwords not readable with current creds",
+                    rs.len()
+                ));
+            }
         }
     }
 }
@@ -1081,6 +1513,792 @@ async fn collect_user_descriptions(
             .with_evidence(&suspicious.join("\n"))
             .with_recommendation("Remove passwords from description fields; use a vault or PAM solution")
             .with_mitre("T1552.001");
+            result.findings.push(finding);
+        }
+    }
+}
+
+// ── Domain password policy ──────────────────────────────────────────────────
+
+async fn collect_domain_password_policy(
+    ldap: &mut ldap3::Ldap,
+    base: &str,
+) -> Option<DomainPasswordPolicy> {
+    // Query the domain root for default password policy attributes
+    let attrs = vec![
+        "minPwdLength",
+        "lockoutThreshold",
+        "lockOutObservationWindow",
+        "lockoutDuration",
+        "maxPwdAge",
+        "pwdHistoryLength",
+        "pwdProperties",
+    ];
+    let Ok((rs, _)) = ldap
+        .search(base, Scope::Base, "(objectClass=*)", attrs)
+        .await
+        .and_then(|r| r.success())
+    else {
+        return None;
+    };
+
+    let entry = rs.into_iter().next()?;
+    let se = SearchEntry::construct(entry);
+
+    let get_u32 = |key: &str| -> u32 {
+        se.attrs
+            .get(key)
+            .and_then(|v| v.first())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+
+    // AD stores time intervals as negative 100-nanosecond intervals
+    let nt_interval_to_minutes = |key: &str| -> u64 {
+        let raw: i64 = se
+            .attrs
+            .get(key)
+            .and_then(|v| v.first())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if raw == 0 || raw == i64::MIN {
+            return 0;
+        }
+        let positive = raw.unsigned_abs();
+        positive / 600_000_000 // 100ns ticks -> minutes
+    };
+
+    let nt_interval_to_days = |key: &str| -> u64 {
+        let raw: i64 = se
+            .attrs
+            .get(key)
+            .and_then(|v| v.first())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        if raw == 0 || raw == i64::MIN {
+            return 0;
+        }
+        let positive = raw.unsigned_abs();
+        positive / 864_000_000_000 // 100ns ticks -> days
+    };
+
+    let pwd_properties = get_u32("pwdProperties");
+
+    Some(DomainPasswordPolicy {
+        min_pwd_length: get_u32("minPwdLength"),
+        lockout_threshold: get_u32("lockoutThreshold"),
+        lockout_observation_window_min: nt_interval_to_minutes("lockOutObservationWindow"),
+        lockout_duration_min: nt_interval_to_minutes("lockoutDuration"),
+        max_pwd_age_days: nt_interval_to_days("maxPwdAge"),
+        pwd_history_length: get_u32("pwdHistoryLength"),
+        complexity_enabled: pwd_properties & 1 != 0,
+    })
+}
+
+// ── gMSA readability ───────────────────────────────────────────────────────
+
+async fn collect_gmsa(ldap: &mut ldap3::Ldap, base: &str, result: &mut ModuleResult) {
+    let filter = "(objectClass=msDS-GroupManagedServiceAccount)";
+    if let Ok((rs, _)) = ldap
+        .search(
+            base,
+            Scope::Subtree,
+            filter,
+            vec![
+                "sAMAccountName",
+                "msDS-GroupMSAMembership",
+                "msDS-ManagedPasswordId",
+            ],
+        )
+        .await
+        .and_then(|r| r.success())
+    {
+        let mut gmsa_accounts = Vec::new();
+        let mut readable = Vec::new();
+
+        for entry in rs {
+            let se = SearchEntry::construct(entry);
+            let name = se
+                .attrs
+                .get("sAMAccountName")
+                .and_then(|v| v.first())
+                .cloned()
+                .unwrap_or_default();
+            gmsa_accounts.push(name.clone());
+
+            // If we can read the msDS-ManagedPasswordId, we likely have read access
+            if se.attrs.contains_key("msDS-ManagedPasswordId") {
+                readable.push(name);
+            }
+        }
+
+        if !gmsa_accounts.is_empty() {
+            ui::info(&format!("{} gMSA account(s) found", gmsa_accounts.len()));
+            for a in &gmsa_accounts {
+                ui::kv("  gMSA", a);
+            }
+        }
+
+        if !readable.is_empty() {
+            ui::warning(&format!(
+                "gMSA password potentially readable for {} account(s)",
+                readable.len()
+            ));
+            let finding = Finding::new(
+                "ldap",
+                "GMSA-001",
+                Severity::High,
+                &format!(
+                    "gMSA password readable for {} account(s)",
+                    readable.len()
+                ),
+            )
+            .with_description(
+                "Current credentials can read gMSA managed password attributes, enabling password extraction",
+            )
+            .with_evidence(&readable.join(", "))
+            .with_recommendation(
+                "Restrict msDS-GroupMSAMembership to only the accounts that need to retrieve the password",
+            )
+            .with_mitre("T1555");
+            result.findings.push(finding);
+        }
+    }
+}
+
+// ── Deleted but recoverable objects ─────────────────────────────────────────
+
+async fn collect_deleted_objects(ldap: &mut ldap3::Ldap, base: &str, result: &mut ModuleResult) {
+    // LDAP_SERVER_SHOW_DELETED_OID — required to see objects in CN=Deleted Objects
+    let show_deleted = RawControl {
+        ctype: "1.2.840.113556.1.4.417".to_string(),
+        crit: true,
+        val: None,
+    };
+
+    let deleted_base = format!("CN=Deleted Objects,{}", base);
+    let filter =
+        "(&(isDeleted=TRUE)(!(isRecycled=TRUE))(|(objectClass=user)(objectClass=computer)))";
+
+    let search_result = ldap
+        .with_controls(vec![show_deleted])
+        .search(
+            &deleted_base,
+            Scope::OneLevel,
+            filter,
+            vec!["cn", "sAMAccountName", "whenChanged", "objectClass"],
+        )
+        .await
+        .and_then(|r| r.success());
+
+    match search_result {
+        Ok((rs, _)) => {
+            let mut deleted = Vec::new();
+            for entry in rs {
+                let se = SearchEntry::construct(entry);
+                let name = se
+                    .attrs
+                    .get("sAMAccountName")
+                    .or(se.attrs.get("cn"))
+                    .and_then(|v| v.first())
+                    .cloned()
+                    .unwrap_or_default();
+                let when = se
+                    .attrs
+                    .get("whenChanged")
+                    .and_then(|v| v.first())
+                    .cloned()
+                    .unwrap_or_default();
+                if !name.is_empty() {
+                    if when.is_empty() {
+                        deleted.push(name);
+                    } else {
+                        deleted.push(format!("{} (deleted: {})", name, when));
+                    }
+                }
+            }
+
+            if !deleted.is_empty() {
+                ui::warning(&format!(
+                    "{} deleted but recoverable object(s) in Recycle Bin",
+                    deleted.len()
+                ));
+                for d in deleted.iter().take(20) {
+                    ui::kv("  Recoverable", d);
+                }
+                if deleted.len() > 20 {
+                    ui::info(&format!("  ... and {} more", deleted.len() - 20));
+                }
+                let finding = Finding::new(
+                    "ldap",
+                    "DEL-001",
+                    Severity::Low,
+                    &format!(
+                        "{} deleted AD object(s) recoverable via Recycle Bin",
+                        deleted.len()
+                    ),
+                )
+                .with_description(
+                    "Deleted user/computer accounts in the AD Recycle Bin can be restored with original permissions and group memberships",
+                )
+                .with_evidence(
+                    &deleted
+                        .iter()
+                        .take(50)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+                .with_recommendation(
+                    "Review and permanently purge deleted accounts; ensure Recycle Bin retention aligns with policy",
+                );
+                result.findings.push(finding);
+            } else {
+                ui::info("No recoverable deleted objects found");
+            }
+        }
+        Err(e) => {
+            ui::verbose(&format!(
+                "Deleted objects query failed: {} (Recycle Bin may not be enabled)",
+                e
+            ));
+            ui::info("AD Recycle Bin check: could not query (may not be enabled)");
+        }
+    }
+}
+
+// ── Pre-Windows 2000 Compatible Access ─────────────────────────────────────
+
+async fn collect_pre2000_group(ldap: &mut ldap3::Ldap, base: &str, result: &mut ModuleResult) {
+    let group_dn = format!(
+        "CN=Pre-Windows 2000 Compatible Access,CN=Builtin,{}",
+        base
+    );
+    if let Ok((rs, _)) = ldap
+        .search(&group_dn, Scope::Base, "(objectClass=*)", vec!["member"])
+        .await
+        .and_then(|r| r.success())
+    {
+        for entry in rs {
+            let se = SearchEntry::construct(entry);
+            let members = se.attrs.get("member").cloned().unwrap_or_default();
+
+            // Well-known SIDs stored as ForeignSecurityPrincipal DNs
+            let has_auth_users = members.iter().any(|m| m.contains("S-1-5-11"));
+            let has_everyone = members.iter().any(|m| m.contains("S-1-1-0"));
+            let has_anonymous = members.iter().any(|m| m.contains("S-1-5-7"));
+
+            if has_auth_users || has_everyone || has_anonymous {
+                let mut dangerous = Vec::new();
+                if has_auth_users {
+                    dangerous.push("Authenticated Users (S-1-5-11)");
+                }
+                if has_everyone {
+                    dangerous.push("Everyone (S-1-1-0)");
+                }
+                if has_anonymous {
+                    dangerous.push("Anonymous Logon (S-1-5-7)");
+                }
+
+                ui::warning(&format!(
+                    "Pre-Windows 2000 group contains: {}",
+                    dangerous.join(", ")
+                ));
+                let finding = Finding::new(
+                    "ldap",
+                    "PRE2K-001",
+                    Severity::Medium,
+                    "Pre-Windows 2000 Compatible Access includes broad identity groups",
+                )
+                .with_description(
+                    "This group grants read access to AD user/group attributes. Including 'Authenticated Users' or 'Everyone' allows any domain user to enumerate all objects.",
+                )
+                .with_evidence(&dangerous.join(", "))
+                .with_recommendation(
+                    "Remove 'Authenticated Users' and 'Everyone' from this group",
+                )
+                .with_mitre("T1087.002");
+                result.findings.push(finding);
+            } else {
+                ui::info(&format!(
+                    "Pre-Windows 2000 group: {} member(s) (no broad identity groups)",
+                    members.len()
+                ));
+            }
+        }
+    }
+}
+
+// ── Inactive / stale accounts ──────────────────────────────────────────────
+
+async fn collect_inactive_accounts(
+    ldap: &mut ldap3::Ldap,
+    base: &str,
+    result: &mut ModuleResult,
+) {
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let ninety_days = 90u64 * 86400;
+    let threshold_unix = now_unix.saturating_sub(ninety_days);
+    let filetime_epoch_diff = 11_644_473_600u64;
+    let threshold_ft = (threshold_unix + filetime_epoch_diff) * 10_000_000;
+
+    let filter = format!(
+        "(&(objectClass=user)(objectCategory=person)(lastLogonTimestamp<={})(!(userAccountControl:1.2.840.113556.1.4.803:=2)))",
+        threshold_ft
+    );
+
+    if let Ok((rs, _)) = ldap
+        .search(
+            base,
+            Scope::Subtree,
+            &filter,
+            vec!["sAMAccountName", "lastLogonTimestamp"],
+        )
+        .await
+        .and_then(|r| r.success())
+    {
+        let mut stale = Vec::new();
+        for entry in rs {
+            let se = SearchEntry::construct(entry);
+            let name = se
+                .attrs
+                .get("sAMAccountName")
+                .and_then(|v| v.first())
+                .cloned()
+                .unwrap_or_default();
+            let last_logon: u64 = se
+                .attrs
+                .get("lastLogonTimestamp")
+                .and_then(|v| v.first())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+
+            if !name.is_empty() && last_logon > 0 {
+                let logon_unix = (last_logon / 10_000_000).saturating_sub(filetime_epoch_diff);
+                let days_ago = now_unix.saturating_sub(logon_unix) / 86400;
+                stale.push(format!("{} ({}d)", name, days_ago));
+            }
+        }
+
+        if !stale.is_empty() {
+            ui::warning(&format!(
+                "{} inactive account(s) (>90 days since last logon)",
+                stale.len()
+            ));
+            for s in stale.iter().take(15) {
+                ui::kv("  Stale", s);
+            }
+            if stale.len() > 15 {
+                ui::info(&format!("  ... and {} more", stale.len() - 15));
+            }
+            let finding = Finding::new(
+                "ldap",
+                "ACCT-001",
+                Severity::Medium,
+                &format!(
+                    "{} inactive account(s) with no logon in 90+ days",
+                    stale.len()
+                ),
+            )
+            .with_description(
+                "Accounts with no recent logon activity are prime targets for credential attacks and may indicate abandoned accounts",
+            )
+            .with_evidence(
+                &stale
+                    .iter()
+                    .take(50)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .with_recommendation(
+                "Disable inactive accounts; implement automated account lifecycle management",
+            )
+            .with_mitre("T1078.002");
+            result.findings.push(finding);
+        }
+    }
+}
+
+// ── Privileged group recursive membership ──────────────────────────────────
+
+async fn collect_privileged_groups(
+    ldap: &mut ldap3::Ldap,
+    base: &str,
+    result: &mut ModuleResult,
+) {
+    let groups = [
+        "Domain Admins",
+        "Enterprise Admins",
+        "Schema Admins",
+        "Administrators",
+        "Account Operators",
+        "Backup Operators",
+        "Server Operators",
+        "DnsAdmins",
+    ];
+
+    let mut all_privileged: Vec<String> = Vec::new();
+    let mut group_details = Vec::new();
+
+    for group_name in &groups {
+        // Find the group DN
+        let gfilter = format!("(&(objectClass=group)(cn={}))", group_name);
+        let dn = match ldap
+            .search(base, Scope::Subtree, &gfilter, vec!["distinguishedName"])
+            .await
+            .and_then(|r| r.success())
+        {
+            Ok((rs, _)) => rs.into_iter().next().map(|e| {
+                let se = SearchEntry::construct(e);
+                se.dn
+            }),
+            Err(_) => None,
+        };
+
+        let Some(group_dn) = dn else { continue };
+
+        // Recursive membership via LDAP_MATCHING_RULE_IN_CHAIN
+        let mfilter = format!(
+            "(&(objectClass=user)(objectCategory=person)(memberOf:1.2.840.113556.1.4.1941:={}))",
+            group_dn
+        );
+
+        if let Ok((rs, _)) = ldap
+            .search(base, Scope::Subtree, &mfilter, vec!["sAMAccountName"])
+            .await
+            .and_then(|r| r.success())
+        {
+            let members: Vec<String> = rs
+                .into_iter()
+                .filter_map(|e| {
+                    let se = SearchEntry::construct(e);
+                    se.attrs
+                        .get("sAMAccountName")
+                        .and_then(|v| v.first().cloned())
+                })
+                .collect();
+
+            if !members.is_empty() {
+                let display = if members.len() <= 5 {
+                    members.join(", ")
+                } else {
+                    format!(
+                        "{}, ... +{} more",
+                        members[..5].join(", "),
+                        members.len() - 5
+                    )
+                };
+                ui::kv(
+                    &format!("  {} (recursive)", group_name),
+                    &format!("{}: {}", members.len(), display),
+                );
+                group_details.push(format!("{}: {} member(s)", group_name, members.len()));
+                all_privileged.extend(members);
+            }
+        }
+    }
+
+    // Deduplicate
+    all_privileged.sort_by_key(|u| u.to_lowercase());
+    all_privileged.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+
+    if !all_privileged.is_empty() {
+        ui::info(&format!(
+            "{} unique privileged user(s) across {} group(s)",
+            all_privileged.len(),
+            group_details.len()
+        ));
+
+        if all_privileged.len() > 15 {
+            let finding = Finding::new(
+                "ldap",
+                "PRIV-001",
+                Severity::Medium,
+                &format!(
+                    "{} privileged accounts — excessive admin footprint",
+                    all_privileged.len()
+                ),
+            )
+            .with_description(
+                "Large number of accounts in privileged groups increases the attack surface for credential theft and lateral movement",
+            )
+            .with_evidence(&group_details.join("\n"))
+            .with_recommendation(
+                "Apply least-privilege: remove unnecessary members; use tiered administration",
+            )
+            .with_mitre("T1078.002");
+            result.findings.push(finding);
+        }
+    }
+}
+
+// ── AdminSDHolder ──────────────────────────────────────────────────────────
+
+async fn collect_adminsdholder(ldap: &mut ldap3::Ldap, base: &str, result: &mut ModuleResult) {
+    let filter = "(&(objectClass=user)(adminCount=1)(!(|(sAMAccountName=Administrator)(sAMAccountName=krbtgt))))";
+    if let Ok((rs, _)) = ldap
+        .search(
+            base,
+            Scope::Subtree,
+            filter,
+            vec!["sAMAccountName", "memberOf"],
+        )
+        .await
+        .and_then(|r| r.success())
+    {
+        let accounts: Vec<String> = rs
+            .into_iter()
+            .filter_map(|e| {
+                let se = SearchEntry::construct(e);
+                se.attrs
+                    .get("sAMAccountName")
+                    .and_then(|v| v.first().cloned())
+            })
+            .collect();
+
+        if !accounts.is_empty() {
+            ui::info(&format!(
+                "{} account(s) with adminCount=1 (AdminSDHolder protected)",
+                accounts.len()
+            ));
+            for a in accounts.iter().take(20) {
+                ui::kv("  AdminSDHolder", a);
+            }
+            if accounts.len() > 20 {
+                ui::info(&format!("  ... and {} more", accounts.len() - 20));
+            }
+
+            let finding = Finding::new(
+                "ldap",
+                "ADMIN-001",
+                Severity::Info,
+                &format!(
+                    "{} non-default account(s) with adminCount=1",
+                    accounts.len()
+                ),
+            )
+            .with_description(
+                "Accounts with adminCount=1 are protected by AdminSDHolder (ACLs reset every 60 min). Some may be orphaned — removed from privileged groups but still flagged.",
+            )
+            .with_evidence(
+                &accounts
+                    .iter()
+                    .take(50)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+            .with_recommendation(
+                "Audit adminCount=1 accounts; clear adminCount on accounts no longer in privileged groups",
+            );
+            result.findings.push(finding);
+        }
+    }
+}
+
+// ── SID History ────────────────────────────────────────────────────────────
+
+async fn collect_sid_history(ldap: &mut ldap3::Ldap, base: &str, result: &mut ModuleResult) {
+    let filter = "(&(objectClass=user)(sIDHistory=*))";
+    if let Ok((rs, _)) = ldap
+        .search(
+            base,
+            Scope::Subtree,
+            filter,
+            vec!["sAMAccountName", "sIDHistory"],
+        )
+        .await
+        .and_then(|r| r.success())
+    {
+        let mut users_with_sid_history = Vec::new();
+        for entry in rs {
+            let se = SearchEntry::construct(entry);
+            let name = se
+                .attrs
+                .get("sAMAccountName")
+                .and_then(|v| v.first())
+                .cloned()
+                .unwrap_or_default();
+            // sIDHistory is binary — count entries
+            let count = se
+                .bin_attrs
+                .get("sIDHistory")
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if !name.is_empty() {
+                users_with_sid_history.push(format!("{} ({} SID(s))", name, count));
+            }
+        }
+
+        if !users_with_sid_history.is_empty() {
+            ui::warning(&format!(
+                "{} account(s) with SID History",
+                users_with_sid_history.len()
+            ));
+            for u in &users_with_sid_history {
+                ui::kv("  SID History", u);
+            }
+            let finding = Finding::new(
+                "ldap",
+                "SID-001",
+                Severity::High,
+                &format!(
+                    "{} account(s) with SID History set",
+                    users_with_sid_history.len()
+                ),
+            )
+            .with_description(
+                "SID History allows an account to inherit access of another SID. Attackers use this for privilege escalation by injecting high-privilege SIDs.",
+            )
+            .with_evidence(&users_with_sid_history.join("\n"))
+            .with_recommendation(
+                "Audit SID History entries; remove after migration is complete; monitor for SID History injection",
+            )
+            .with_mitre("T1134.005");
+            result.findings.push(finding);
+        }
+    }
+}
+
+// ── Service account heuristics ─────────────────────────────────────────────
+
+async fn collect_service_accounts(
+    ldap: &mut ldap3::Ldap,
+    base: &str,
+    result: &mut ModuleResult,
+) {
+    let filter = "(&(objectClass=user)(objectCategory=person)(|(sAMAccountName=*svc*)(sAMAccountName=*service*)(sAMAccountName=*sql*)(sAMAccountName=*backup*)(sAMAccountName=*scan*)(sAMAccountName=*batch*)(sAMAccountName=*task*)(sAMAccountName=*iis*)(sAMAccountName=svc_*)(sAMAccountName=sa_*)))";
+
+    if let Ok((rs, _)) = ldap
+        .search(
+            base,
+            Scope::Subtree,
+            filter,
+            vec![
+                "sAMAccountName",
+                "userAccountControl",
+                "servicePrincipalName",
+                "adminCount",
+            ],
+        )
+        .await
+        .and_then(|r| r.success())
+    {
+        let mut svc_accounts = Vec::new();
+        let mut pwd_never_expires = Vec::new();
+        let mut with_admin = Vec::new();
+
+        for entry in rs {
+            let se = SearchEntry::construct(entry);
+            let name = se
+                .attrs
+                .get("sAMAccountName")
+                .and_then(|v| v.first())
+                .cloned()
+                .unwrap_or_default();
+            let uac: u32 = se
+                .attrs
+                .get("userAccountControl")
+                .and_then(|v| v.first())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            let has_spn = se.attrs.contains_key("servicePrincipalName");
+            let admin_count: u32 = se
+                .attrs
+                .get("adminCount")
+                .and_then(|v| v.first())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+
+            // DONT_EXPIRE_PASSWORD = 0x10000, ACCOUNTDISABLE = 0x2
+            let pwd_no_expire = uac & 0x10000 != 0;
+            let disabled = uac & 0x2 != 0;
+            if disabled {
+                continue;
+            }
+
+            let mut flags = Vec::new();
+            if has_spn {
+                flags.push("SPN");
+            }
+            if pwd_no_expire {
+                flags.push("PWD_NEVER_EXPIRES");
+            }
+            if admin_count > 0 {
+                flags.push("ADMIN");
+            }
+
+            let entry_str = if flags.is_empty() {
+                name.clone()
+            } else {
+                format!("{} [{}]", name, flags.join(", "))
+            };
+            svc_accounts.push(entry_str);
+
+            if pwd_no_expire {
+                pwd_never_expires.push(name.clone());
+            }
+            if admin_count > 0 {
+                with_admin.push(name.clone());
+            }
+        }
+
+        if !svc_accounts.is_empty() {
+            ui::info(&format!(
+                "{} service account(s) identified by naming convention",
+                svc_accounts.len()
+            ));
+            for s in svc_accounts.iter().take(20) {
+                ui::kv("  Service Acct", s);
+            }
+            if svc_accounts.len() > 20 {
+                ui::info(&format!("  ... and {} more", svc_accounts.len() - 20));
+            }
+        }
+
+        if !pwd_never_expires.is_empty() {
+            let finding = Finding::new(
+                "ldap",
+                "SVC-001",
+                Severity::Medium,
+                &format!(
+                    "{} service account(s) with password never expires",
+                    pwd_never_expires.len()
+                ),
+            )
+            .with_description(
+                "Service accounts with DONT_EXPIRE_PASSWORD are high-value targets — stale passwords are more likely to be cracked",
+            )
+            .with_evidence(&pwd_never_expires.join(", "))
+            .with_recommendation(
+                "Migrate to gMSA for automatic rotation; or enforce regular password changes",
+            )
+            .with_mitre("T1078.002");
+            result.findings.push(finding);
+        }
+
+        if !with_admin.is_empty() {
+            let finding = Finding::new(
+                "ldap",
+                "SVC-002",
+                Severity::High,
+                &format!(
+                    "{} service account(s) with admin privileges",
+                    with_admin.len()
+                ),
+            )
+            .with_description(
+                "Service accounts with adminCount=1 have administrative privileges. Compromising these provides broad domain access.",
+            )
+            .with_evidence(&with_admin.join(", "))
+            .with_recommendation(
+                "Apply least-privilege: remove admin rights from service accounts; use separate admin and service tiers",
+            )
+            .with_mitre("T1078.002");
             result.findings.push(finding);
         }
     }

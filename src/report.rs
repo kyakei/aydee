@@ -66,6 +66,12 @@ pub async fn generate(
     let html = generate_html_report(&report);
     write_output_file(&html_path, &html).await?;
 
+    // Markdown report
+    spin.set_message("writing Markdown report...");
+    let md_path = Path::new(output_dir).join("aydee_report.md");
+    let md = generate_markdown_report(&report);
+    write_output_file(&md_path, &md).await?;
+
     // Workspace manifest
     spin.set_message("writing manifest...");
     let manifest_path = resolve_output_path(output_dir, manifest_json);
@@ -76,6 +82,7 @@ pub async fn generate(
     ui::kv("JSON", &json_path.display().to_string());
     ui::kv("Text", &text_path.display().to_string());
     ui::kv("HTML", &html_path.display().to_string());
+    ui::kv("Markdown", &md_path.display().to_string());
     ui::kv("Manifest", &manifest_path.display().to_string());
 
     // Display risk score and findings summary
@@ -529,6 +536,179 @@ fn html_escape(s: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+// ── Markdown report ─────────────────────────────────────────────────────────
+
+fn generate_markdown_report(report: &RunReport) -> String {
+    let mut md = String::new();
+
+    md.push_str("# AyDee — AD Recon Report\n\n");
+
+    md.push_str("## Overview\n\n");
+    md.push_str("| Field | Value |\n|-------|-------|\n");
+    md.push_str(&format!("| **Target** | `{}` |\n", report.target));
+    md.push_str(&format!(
+        "| **Domain** | `{}` |\n",
+        report.domain.as_deref().unwrap_or("unknown")
+    ));
+    md.push_str(&format!("| **Mode** | {} |\n", report.mode));
+    md.push_str(&format!("| **Auth** | {} |\n", report.auth_method));
+    md.push_str(&format!("| **Duration** | {}ms |\n", report.duration_ms));
+    md.push_str(&format!(
+        "| **Users Collected** | {} |\n",
+        report.collected_users.len()
+    ));
+    md.push_str(&format!("| **Timestamp** | {} |\n", report.start_time));
+    md.push('\n');
+
+    // Risk score
+    md.push_str("## Risk Assessment\n\n");
+    md.push_str(&format!(
+        "**{}** (score: {})\n\n",
+        report.risk_score.rating(),
+        report.risk_score.total
+    ));
+    md.push_str(&format!(
+        "| Critical | High | Medium | Low | Info |\n|----------|------|--------|-----|------|\n| {} | {} | {} | {} | {} |\n\n",
+        report.risk_score.critical,
+        report.risk_score.high,
+        report.risk_score.medium,
+        report.risk_score.low,
+        report.risk_score.info,
+    ));
+
+    // Open ports
+    md.push_str("## Open Ports\n\n");
+    if report.open_ports.is_empty() {
+        md.push_str("No open ports detected.\n\n");
+    } else {
+        md.push_str("| Port | Service |\n|------|--------|\n");
+        for port in &report.open_ports {
+            md.push_str(&format!(
+                "| {} | {} |\n",
+                port,
+                crate::types::service_name(*port)
+            ));
+        }
+        md.push('\n');
+    }
+
+    // Findings by severity
+    md.push_str("## Findings\n\n");
+    if report.findings.is_empty() {
+        md.push_str("No findings.\n\n");
+    } else {
+        for severity in &[
+            Severity::Critical,
+            Severity::High,
+            Severity::Medium,
+            Severity::Low,
+            Severity::Info,
+        ] {
+            let filtered: Vec<&Finding> = report
+                .findings
+                .iter()
+                .filter(|f| f.severity == *severity)
+                .collect();
+            if filtered.is_empty() {
+                continue;
+            }
+
+            let icon = match severity {
+                Severity::Critical => "🔴",
+                Severity::High => "🟠",
+                Severity::Medium => "🟡",
+                Severity::Low => "🔵",
+                Severity::Info => "⚪",
+            };
+
+            md.push_str(&format!(
+                "### {} {} ({})\n\n",
+                icon,
+                severity.label(),
+                filtered.len()
+            ));
+
+            for f in filtered {
+                md.push_str(&format!("#### `{}` — {}\n\n", f.id, f.title));
+
+                if !f.description.is_empty() {
+                    md.push_str(&format!("{}\n\n", f.description));
+                }
+
+                if !f.evidence.is_empty() {
+                    md.push_str("**Evidence:**\n```\n");
+                    for e in &f.evidence {
+                        md.push_str(&format!("{}\n", e));
+                    }
+                    md.push_str("```\n\n");
+                }
+
+                if !f.recommendation.is_empty() {
+                    md.push_str(&format!(
+                        "> **Recommendation:** {}\n\n",
+                        f.recommendation
+                    ));
+                }
+
+                if let Some(ref mitre) = f.mitre {
+                    md.push_str(&format!("MITRE ATT&CK: `{}`\n\n", mitre));
+                }
+
+                md.push_str("---\n\n");
+            }
+        }
+    }
+
+    // Module results
+    md.push_str("## Module Results\n\n");
+    md.push_str("| Module | Status | Duration | Findings |\n|--------|--------|----------|----------|\n");
+    for m in &report.modules {
+        let status = match &m.status {
+            crate::types::ModuleStatus::Complete => "✅ Complete",
+            crate::types::ModuleStatus::Failed(_) => "❌ Failed",
+            crate::types::ModuleStatus::Skipped(_) => "⏭ Skipped",
+            crate::types::ModuleStatus::Running => "🔄 Running",
+            crate::types::ModuleStatus::Pending => "⏳ Pending",
+        };
+        md.push_str(&format!(
+            "| {} | {} | {}ms | {} |\n",
+            m.name, status, m.duration_ms, m.findings.len()
+        ));
+    }
+    md.push('\n');
+
+    // Collected users (first 50)
+    if !report.collected_users.is_empty() {
+        md.push_str("## Collected Users\n\n");
+        md.push_str(&format!(
+            "{} user(s) collected.\n\n",
+            report.collected_users.len()
+        ));
+        if report.collected_users.len() > 50 {
+            md.push_str("<details><summary>Show users (first 50)</summary>\n\n");
+        }
+        md.push_str("```\n");
+        for (i, user) in report.collected_users.iter().enumerate() {
+            if i >= 50 {
+                md.push_str(&format!("... and {} more\n", report.collected_users.len() - 50));
+                break;
+            }
+            md.push_str(&format!("{}\n", user));
+        }
+        md.push_str("```\n\n");
+        if report.collected_users.len() > 50 {
+            md.push_str("</details>\n\n");
+        }
+    }
+
+    md.push_str(&format!(
+        "\n---\n*Generated by AyDee at {}*\n",
+        report.start_time
+    ));
+
+    md
 }
 
 // ── Manifest ────────────────────────────────────────────────────────────────

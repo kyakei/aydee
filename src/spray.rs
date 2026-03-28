@@ -3,7 +3,7 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::{sleep, timeout};
 
-use crate::types::{Finding, ModuleResult, Severity, StageTimer};
+use crate::types::{DomainPasswordPolicy, Finding, ModuleResult, Severity, StageTimer};
 use crate::ui;
 
 /// Run SMB password spray against collected users.
@@ -16,10 +16,35 @@ pub async fn run(
     max_users: usize,
     delay_ms: u64,
     non_interactive: bool,
+    policy: Option<&DomainPasswordPolicy>,
 ) -> Result<ModuleResult> {
     ui::section("PASSWORD SPRAY");
     let timer = StageTimer::start();
     let mut result = ModuleResult::new("spray");
+
+    // Show policy-aware spray guidance
+    if let Some(pol) = policy {
+        if pol.lockout_threshold > 0 {
+            let safe_attempts = if pol.lockout_threshold > 2 {
+                pol.lockout_threshold - 2
+            } else {
+                1
+            };
+            ui::info(&format!(
+                "Lockout policy: {} attempts / {} min window — safe limit: {} per window",
+                pol.lockout_threshold, pol.lockout_observation_window_min, safe_attempts
+            ));
+            if passwords.len() as u32 > safe_attempts {
+                ui::warning(&format!(
+                    "Spraying {} passwords exceeds safe limit of {} — risk of lockout!",
+                    passwords.len(),
+                    safe_attempts
+                ));
+            }
+        } else {
+            ui::info("No lockout policy — spraying safely");
+        }
+    }
 
     // Build user list
     let mut users: Vec<String> = collected_users

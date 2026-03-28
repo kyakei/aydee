@@ -29,8 +29,8 @@ use types::{AuthMethod, AuthStrategy, LdapInfo, ModuleResult, RunMode};
 #[command(name = "aydee", version = "2.0.0")]
 #[command(about = "Active Directory enumeration and reconnaissance toolkit")]
 struct Args {
-    /// Target IP or hostname
-    #[arg(short, long)]
+    /// Target DC IP or hostname
+    #[arg(short, long, visible_alias = "dc")]
     target: String,
 
     /// Domain name (e.g., corp.local)
@@ -113,6 +113,10 @@ struct Args {
     #[arg(short, long)]
     verbose: bool,
 
+    /// Quiet mode — only show findings and errors
+    #[arg(short, long)]
+    quiet: bool,
+
     /// Non-interactive mode (skip all prompts)
     #[arg(long)]
     non_interactive: bool,
@@ -163,9 +167,18 @@ async fn main() -> Result<()> {
 
     // Set global verbose flag
     ui::set_verbose(args.verbose);
+    ui::set_quiet(args.quiet);
 
     // Banner
     ui::banner();
+
+    // Proxychains / tunnel detection
+    if env::var("LD_PRELOAD").unwrap_or_default().contains("proxychains")
+        || env::var("PROXYCHAINS_CONF_FILE").is_ok()
+    {
+        ui::warning("Proxychains detected — UDP-based modules (DNS, NTP clock sync) will likely fail");
+        ui::info("Consider: --no-clock and providing -d <domain> manually to skip DNS discovery");
+    }
 
     if let Some(ccache) = args.ccache.as_deref() {
         let cache_value = resolve_ccache_env_value(launch_cwd.as_deref(), ccache);
@@ -275,6 +288,18 @@ async fn main() -> Result<()> {
             Err(e) => {
                 ui::fail(&format!("Port scan failed: {}", e));
             }
+        }
+    }
+
+    // Target DC validation
+    if !open_ports.is_empty() {
+        let dc_indicators = [88, 389, 636, 3268];
+        let dc_port_count = dc_indicators.iter().filter(|p| open_ports.contains(p)).count();
+        if dc_port_count == 0 && !open_ports.contains(&445) {
+            ui::warning("Target does not appear to be a domain controller (no Kerberos, LDAP, or SMB ports detected)");
+            ui::info("If intentional, ignore this warning. Otherwise verify the target IP with --dc <ip>");
+        } else if dc_port_count == 0 {
+            ui::info("Note: no LDAP/Kerberos ports open — target may be a member server rather than a DC");
         }
     }
 
@@ -525,6 +550,11 @@ async fn main() -> Result<()> {
 
     // Password spray
     if should_run("spray") && !args.spray_passwords.is_empty() {
+        // Extract password policy from LDAP results if available
+        let password_policy = module_results
+            .iter()
+            .find_map(|r| r.password_policy.as_ref());
+
         match spray::run(
             &args.target,
             discovered_domain.as_deref().unwrap_or(""),
@@ -534,11 +564,86 @@ async fn main() -> Result<()> {
             args.spray_limit,
             args.spray_delay,
             args.non_interactive,
+            password_policy,
         )
         .await
         {
             Ok(result) => module_results.push(result),
             Err(e) => ui::fail(&format!("Password spray failed: {}", e)),
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    //  ATTACK PATH CORRELATION
+    // ═══════════════════════════════════════════════════════════════════════
+
+    {
+        let all_findings: Vec<&types::Finding> = module_results
+            .iter()
+            .flat_map(|r| r.findings.iter())
+            .collect();
+
+        let has_no_signing = all_findings
+            .iter()
+            .any(|f| f.id == "SMB-SIGN-001");
+        let has_coercion = all_findings
+            .iter()
+            .any(|f| f.id.starts_with("COERCE-"));
+        let has_esc8 = all_findings
+            .iter()
+            .any(|f| f.id == "ADCS-ESC8");
+        let has_maq = all_findings
+            .iter()
+            .any(|f| f.id == "MAQ-001");
+        let has_webdav = all_findings
+            .iter()
+            .any(|f| f.id == "WEBDAV-001");
+        let has_esc1 = all_findings
+            .iter()
+            .any(|f| f.id == "ADCS-ESC1");
+
+        let mut attack_paths = Vec::new();
+
+        if has_coercion && has_esc8 {
+            attack_paths.push("Coercion + ADCS ESC8 → relay NTLM auth to Web Enrollment → domain admin cert");
+        }
+        if has_coercion && has_no_signing {
+            attack_paths.push("Coercion + no SMB signing → relay NTLM to SMB for code execution");
+        }
+        if has_maq && has_no_signing {
+            attack_paths.push("MAQ > 0 + no SMB signing → create machine account + RBCD relay → impersonate any user");
+        }
+        if has_webdav && has_coercion {
+            attack_paths.push("WebDAV + coercion → cross-protocol relay (HTTP→LDAP/SMB)");
+        }
+        if has_esc1 {
+            attack_paths.push("ESC1 template → enroll cert as any user → domain admin via PKINIT");
+        }
+        if has_maq && has_coercion && has_esc8 {
+            attack_paths.push("MAQ + coercion + ESC8 → full relay chain: create machine → coerce DC → relay to ADCS");
+        }
+
+        if !attack_paths.is_empty() {
+            ui::section("ATTACK PATH CORRELATION");
+            for path in &attack_paths {
+                ui::warning(path);
+            }
+
+            let mut relay_result = ModuleResult::new("relay-map");
+            let finding = types::Finding::new(
+                "relay-map",
+                "RELAY-MAP",
+                types::Severity::Critical,
+                &format!("{} viable attack path(s) identified", attack_paths.len()),
+            )
+            .with_description(&attack_paths.join("\n"))
+            .with_recommendation(
+                "Priority: enforce SMB signing, disable unnecessary coercion services, harden ADCS, set MAQ to 0",
+            )
+            .with_mitre("T1557.001");
+            relay_result.findings.push(finding);
+            relay_result = relay_result.success(std::time::Duration::ZERO);
+            module_results.push(relay_result);
         }
     }
 

@@ -1,6 +1,7 @@
 /target
 /results
 /backup
+/project2
 *.swp
 *.swo
 *~

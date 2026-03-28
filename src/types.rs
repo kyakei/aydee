@@ -121,6 +121,9 @@ pub fn service_name(port: u16) -> &'static str {
         5986 => "WinRM HTTPS",
         8080 => "HTTP-Proxy",
         8443 => "HTTPS-Alt",
+        1433 => "MSSQL",
+        1434 => "MSSQL-Browser",
+        3389 => "RDP",
         9389 => "ADWS",
         _ => "unknown",
     }
@@ -135,6 +138,8 @@ pub struct ModuleResult {
     pub duration_ms: u64,
     pub findings: Vec<Finding>,
     pub collected_users: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password_policy: Option<DomainPasswordPolicy>,
 }
 
 impl ModuleResult {
@@ -145,6 +150,7 @@ impl ModuleResult {
             duration_ms: 0,
             findings: Vec::new(),
             collected_users: Vec::new(),
+            password_policy: None,
         }
     }
 
@@ -225,6 +231,23 @@ pub struct LdapInfo {
     pub functional_level: Option<String>,
     pub naming_context: Option<String>,
     pub usernames: Vec<String>,
+}
+
+/// Domain-level password/lockout policy from the domain root object.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DomainPasswordPolicy {
+    pub min_pwd_length: u32,
+    pub lockout_threshold: u32,
+    /// Lockout observation window in minutes.
+    pub lockout_observation_window_min: u64,
+    /// Lockout duration in minutes (0 = until admin unlock).
+    pub lockout_duration_min: u64,
+    /// Max password age in days.
+    pub max_pwd_age_days: u64,
+    /// Password history length.
+    pub pwd_history_length: u32,
+    /// Password complexity required.
+    pub complexity_enabled: bool,
 }
 
 // ── RPC endpoint ────────────────────────────────────────────────────────────
